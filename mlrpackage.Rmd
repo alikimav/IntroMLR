@@ -1,0 +1,93 @@
+---
+title: "Working with the mlr package"
+output: html_document
+---
+
+To get acquainted with the mlr package, I created an Rmarkdown document with basic and advanced features from the mlr tutorial on regression and classification problems with data available in R. 
+
+```{r, echo=FALSE, message=FALSE}
+library(mlr)
+```
+## Getting started
+
+The first step is to create a **task**; this can be a classification, regression, survival, cluster, cost-sensitive classification or multilabel task. For example, let us start with the `iris` data set from which we wish to predict the `Species` based on features comprised of width and length measurements of sepals and petals. 
+
+```{r}
+task <- makeClassifTask(data = iris, target = "Species")
+```
+
+There exist other options that can be set when calling the task function like, for instance, weights and blocking. The latter is for observations that are required to be considered together such that when resampling or cross-validating, grouped observations are included either all in the train or all in the test set.
+
+Next, we choose a learner. Here, we choose to learn based on a classification tree fitted through the `rpart` function. 
+
+```{r}
+lrn <- makeLearner("classif.rpart")
+```
+
+We can get a description of all possible parameter settings for a learner using `?getParamSet(lrn)`:
+
+```{r, results='markup'}
+getParamSet(lrn)
+```
+
+Further, we can create a description object for a resampling startegy using `makeResampleDesc`. For example, we may wish to carry out a 3-fold cross-validation of `rpart` on `iris`.
+
+```{r}
+cv3f <- makeResampleDesc("CV", iters = 3, stratify = TRUE )
+```
+
+Finally, we can fit the model specified by `lrn` on the `task` and calculate predictions and performance measures for all training and all test sets specified by the above resampling description.
+
+```{r, message=FALSE}
+set.seed(123)
+r <- resample(lrn, task, cv3f)
+r$aggr 
+```
+
+The mean misclassification error is given by `r r$aggr`. The default measure for a classification task is the misclassification error, `mmce` but it is possible to choose a different measure, say *accuracy*, `acc` which is given by  1 - `mmce`. We will see later that we can also define our own measures. 
+
+```{r, message=FALSE}
+set.seed(123)
+r <- resample(lrn, task, cv3f, measures = acc)
+r$aggr 
+```
+
+
+
+## Basics
+
+### Tasks
+
+As previously mentioned, depending on the type of problem at hand, one can define an appropriate task. We have seen an instance of a classification problem above, let us now look at a supervised regression problem using the `BostonHousing` data. By printing task, we get some information on the task object we have just created and the associated data.
+
+```{r}
+data(BostonHousing, package = "mlbench")
+task <- makeRegrTask(data = BostonHousing, target = "medv")
+print(task)
+```
+
+#### Modifying a task
+
+Once the task is created, it can be modified in several ways. For example, the function `subsetTask` allows the selection of certain observations and/or features. 
+
+```{r}
+names(BostonHousing)
+modifiedtask <- subsetTask(task, subset = 1:400, features = c("crim", "age", "dis", "lstat"))
+str(getTaskData(modifiedtask))
+```
+
+Using `getTaskData` we can see that the modified task now includes 400 observations and 5 variables (the 4 included in the features character vector above and the target variable which will always be included). Some other useful functions are the following:
+
+  1. `removeConstantFeatures(<task name>)`:
+  
+  constant features may arise dur to an inherent feature in the data collected or as a result of choosing a subset of observations.
+  
+  2. `dropFeatures(task, c("rm", "nox"))`:
+  
+  remove selected features from the task.
+  
+  3. `normalizeFeatures(task, method = "standardize")`:
+  
+  normalize numerical features by different methods (nonnumerical features are left untouched). The normalizing method can be one of `center` (subtract mean), `scale` (divide by standard deviation), `standardize` (center and scale), `range` (scale to a given range - default is [0, 1]). The optional argument `exclude` may be used to supply a character vector of columns to be excluded from the normalization. Type `?normalizeFeatures` for more info.
+
+## Learners
