@@ -7,6 +7,8 @@ To get acquainted with the mlr package, I created an Rmarkdown document with bas
 
 ```{r, echo=FALSE, message=FALSE}
 library(mlr)
+library(randomForest)
+library(gbm)
 ```
 ## Getting started
 
@@ -91,3 +93,18 @@ Using `getTaskData` we can see that the modified task now includes 400 observati
   normalize numerical features by different methods (nonnumerical features are left untouched). The normalizing method can be one of `center` (subtract mean), `scale` (divide by standard deviation), `standardize` (center and scale), `range` (scale to a given range - default is [0, 1]). The optional argument `exclude` may be used to supply a character vector of columns to be excluded from the normalization. Type `?normalizeFeatures` for more info.
 
 ## Learners
+
+Many of the popular learning algorithms are already implemented in `mlr`. The `makeLearner` function requires the user to specify the learning method. Additionally, it is possible to modify defaults on the prediction type (i.e. for classification, we may choose `predict.type = "prob"` for probabilities), or set hyperparameters using a `list` passed to the `par.vals` argument.
+
+```{r}
+class.lrn <- makeLearner("classif.randomForest", predict.type = "prob", fix.factors.prediction = TRUE)
+regr.lrn <- makeLearner("regr.gbm", par.vals = list(n.trees = 500, interaction.depth = 4))
+#cluster.lrn <- makeLearner("cluster.SimpleKMeans", N = 5)
+```
+
+Note that the `fix.factors.prediction = TRUE` argument is useful in situations where a factor level is present in the training data set but not the test data set; it adds a factor level for missing data in the test set thus avoiding problems. 
+
+The Learner object is a list and information can be extracted using the `$`, e.g. `regr.lrn$par.vals`. This information can also be accessed using other functions in `mlr`, for instance, `getHyperPars(lrn)` retrieves the current hyperparameter settings of the learner `lrn`. We also used above `getParamSet(lrn)` to get a description of all possible parameter settings for `lrn`. 
+
+
+

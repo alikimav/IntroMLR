@@ -150,6 +150,12 @@ str(getTaskData(modifiedtask))</code></pre>
 </div>
 <div id="learners" class="section level2">
 <h2>Learners</h2>
+<p>Many of the popular learning algorithms are already implemented in <code>mlr</code>. The <code>makeLearner</code> function requires the user to specify the learning method. Additionally, it is possible to modify defaults on the prediction type (i.e. for classification, we may choose <code>predict.type = &quot;prob&quot;</code> for probabilities), or set hyperparameters using a <code>list</code> passed to the <code>par.vals</code> argument.</p>
+<pre class="r"><code>class.lrn &lt;- makeLearner(&quot;classif.randomForest&quot;, predict.type = &quot;prob&quot;, fix.factors.prediction = TRUE)
+regr.lrn &lt;- makeLearner(&quot;regr.gbm&quot;, par.vals = list(n.trees = 500, interaction.depth = 4))
+#cluster.lrn &lt;- makeLearner(&quot;cluster.SimpleKMeans&quot;, N = 5)</code></pre>
+<p>Note that the <code>fix.factors.prediction = TRUE</code> argument is useful in situations where a factor level is present in the training data set but not the test data set; it adds a factor level for missing data in the test set thus avoiding problems.</p>
+<p>The Learner object is a list and information can be extracted using the <code>$</code>, e.g. <code>regr.lrn$par.vals</code>. This information can also be accessed using other functions in <code>mlr</code>, for instance, <code>getHyperPars(lrn)</code> retrieves the current hyperparameter settings of the learner <code>lrn</code>. We also used above <code>getParamSet(lrn)</code> to get a description of all possible parameter settings for <code>lrn</code>.</p>
 </div>
 
 
