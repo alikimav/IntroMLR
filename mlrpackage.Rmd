@@ -120,7 +120,7 @@ regr.lrn <- removeHyperPars(regr.lrn, c("n.trees", "interaction.depth"))
 
 Note `removeHyperPars` sets the hyperparameters back to their default values.
 
-### Training
+### Train
 
 Once we create the task from the data set and identify the learning algorithm, the next step is to train the learner using the `train` command.
 
@@ -142,7 +142,7 @@ mod <- train(lrn, task, subset = train.set)
 getLearnerModel(mod)
 ```
 
-Finally, a note on weights passed as an argument in the `train` function. As an example for an application of weights[^ note that mlr offers alternatives with more functionality for imbalanced classification problems] used in `train`, consider the `BreastCancer` data for which the target variable `Class` identifies 241 malignant and 458 benign cases. To deal with the imbalanced classes, we can incorporate weights in an attempt to allow the two classes to be equally represented in training the classifier. Here we use the predefined task `bc.task` in mlr. The `getTaskTargets` function gets the target data from a task (in this example, this is equivalent to the vector `BreastCancer$Class`). Note that if weights are defined in task as well then those would be overwritten by the weights in `train`. 
+Finally, a note on weights passed as an argument in the `train` function. As an example for an application of weights ^[note that mlr offers alternatives with more functionality for imbalanced classification problems] used in `train`, consider the `BreastCancer` data for which the target variable `Class` identifies 241 malignant and 458 benign cases. To deal with the imbalanced classes, we can incorporate weights in an attempt to allow the two classes to be equally represented in training the classifier. Here we use the predefined task `bc.task` in mlr. The `getTaskTargets` function gets the target data from a task (in this example, this is equivalent to the vector `BreastCancer$Class`). Note that if weights are defined in task as well then those would be overwritten by the weights in `train`. 
 
 ```{r}
 target <- getTaskTargets(bc.task)
@@ -154,6 +154,59 @@ fancyRpartPlot(getLearnerModel(mod), sub = "")
 ```
 
 Weights can also be useful as a means to grant more importance to recently collected data versus older data or to reduce the influence of outliers.
+
+### Predict
+
+To predict target values, we use the `predict` function which takes as input the object returned by `train` and data for which we want predictions. The data can either come from the task (using the `task` argument) or it can be a data frame (passed using the `newdata` argument). Similarly to the `train` function, the `subset` argument may be used to pass different portions of the data in task. 
+
+```{r}
+n <- getTaskSize(bh.task)
+train.set <- seq(1, n, by = 2)
+test.set <- seq(2, n, by = 2)
+lrn <- makeLearner("regr.gbm", n.trees = 100, interaction.depth = 4)
+mod <- train(lrn, bh.task, subset = train.set)
+preds <- predict(mod, task = bh.task, subset = test.set)
+preds
+```
+
+The function `predict` returns a list; The `$data` element of that list contains the true values of the target variable (in case of supervised learning) and the predictions. A direct way to obtain the true and predicted values of the target variable is through the `getPredictionTruth(preds)` and `getPredictionResponse(preds)` commands where `preds` is the list returned by the `predict` function.
+
+```{r}
+head(getPredictionTruth(preds), 10)
+head(getPredictionResponse(preds), 10)
+```
+
+For classification problems, class labels are predicted. We can obtain a confusion matrix through the command `getConfMatrix`. To get predicted posterior probabilities, we need to create the learner with `predict.type = "prob"`.
+
+```{r}
+lrn <- makeLearner("classif.rpart", predict.type = "prob")
+mod <- train(lrn, iris.task)
+preds <- predict(mod, newdata = iris)
+head(as.data.frame(preds))
+head(getPredictionProbabilities(preds))
+```
+
+We can also adjust the threshold value that is used to map the predicted posterior probabilities to the class labels. The default value for binary classification is 0.5; however, it may be necessary to increase/decrease this value in various situations such as in the case of classifying cancer rates where one would be concerned with false negatives (prediction of no cancer when the truth is yes cancer). By changing the threshold we change the sensitivity of the model. An example for adjusting the threshold in a binary classification setting is shown below. 
+
+```{r}
+data(Sonar)
+table(Sonar$Class)
+getTaskDescription(sonar.task)$positive
+lrn <- makeLearner("classif.rpart", predict.type = "prob")
+mod <- train(lrn, task = sonar.task)
+# predict with default threshold
+preds <- predict(mod, sonar.task)
+preds$threshold
+# set threshold value for +ve class
+preds2 <- setThreshold(preds, 0.9)
+# confusion matrices
+getConfMatrix(preds)
+getConfMatrix(preds2)
+```
+
+For multiclass classification problems, the threshold is given by a named vector specifying the values by which each probability will be divided. 
+
+
 
 
 
