@@ -9,6 +9,8 @@ To get acquainted with the mlr package, I created an Rmarkdown document with bas
 library(mlr)
 library(randomForest)
 library(gbm)
+library(mlbench)
+library(rattle)
 ```
 ## Getting started
 
@@ -92,7 +94,7 @@ Using `getTaskData` we can see that the modified task now includes 400 observati
   
   normalize numerical features by different methods (nonnumerical features are left untouched). The normalizing method can be one of `center` (subtract mean), `scale` (divide by standard deviation), `standardize` (center and scale), `range` (scale to a given range - default is [0, 1]). The optional argument `exclude` may be used to supply a character vector of columns to be excluded from the normalization. Type `?normalizeFeatures` for more info.
 
-## Learners
+### Learners
 
 Many of the popular learning algorithms are already implemented in `mlr`. The `makeLearner` function requires the user to specify the learning method. Additionally, it is possible to modify defaults on the prediction type (i.e. for classification, we may choose `predict.type = "prob"` for probabilities), or set hyperparameters using a `list` passed to the `par.vals` argument.
 
@@ -105,6 +107,53 @@ regr.lrn <- makeLearner("regr.gbm", par.vals = list(n.trees = 500, interaction.d
 Note that the `fix.factors.prediction = TRUE` argument is useful in situations where a factor level is present in the training data set but not the test data set; it adds a factor level for missing data in the test set thus avoiding problems. 
 
 The Learner object is a list and information can be extracted using the `$`, e.g. `regr.lrn$par.vals`. This information can also be accessed using other functions in `mlr`, for instance, `getHyperPars(lrn)` retrieves the current hyperparameter settings of the learner `lrn`. We also used above `getParamSet(lrn)` to get a description of all possible parameter settings for `lrn`. 
+
+#### Modifying a learner
+
+Just like it was possible to modify an existing task, we can also do so for a learner. Modifications include changing the `id` (this is either user specified or, if omitted, it is automatically set to the algorithm name), the prediction type, hyperparameter values, and more.
+
+```{r}
+class.lrn <- setPredictType(class.lrn, "response")
+regr.lrn <- setHyperPars(regr.lrn, n.trees = 400)
+regr.lrn <- removeHyperPars(regr.lrn, c("n.trees", "interaction.depth"))
+```
+
+Note `removeHyperPars` sets the hyperparameters back to their default values.
+
+### Training
+
+Once we create the task from the data set and identify the learning algorithm, the next step is to train the learner using the `train` command.
+
+```{r}
+task <- makeClassifTask(data = iris, target = "Species")
+lrn <- makeLearner("classif.lda")
+mod <- train(lrn, task)
+mod
+```
+
+The function `train` returns a list. The fitted model can be extracted using the `getLearnerModel(mod)` command. It is possible to choose a subset of observations to be used to train the model; this is achieved via the `subset` argument in `train`. Note that this is usually not needed since resampling strategies are supported. In the following example, we use the `BostonHousing` data to fit a linear model to the regression task. Note that `getTaskSize` returns the number of observations in a task.
+
+```{r}
+data(BostonHousing, package = "mlbench")
+task <- makeRegrTask(data = BostonHousing, target = "medv")
+lrn <- makeLearner("regr.lm")
+train.set <- sample(getTaskSize(task), size = getTaskSize(task)/3)
+mod <- train(lrn, task, subset = train.set)
+getLearnerModel(mod)
+```
+
+Finally, a note on weights passed as an argument in the `train` function. As an example for an application of weights[^ note that mlr offers alternatives with more functionality for imbalanced classification problems] used in `train`, consider the `BreastCancer` data for which the target variable `Class` identifies 241 malignant and 458 benign cases. To deal with the imbalanced classes, we can incorporate weights in an attempt to allow the two classes to be equally represented in training the classifier. Here we use the predefined task `bc.task` in mlr. The `getTaskTargets` function gets the target data from a task (in this example, this is equivalent to the vector `BreastCancer$Class`). Note that if weights are defined in task as well then those would be overwritten by the weights in `train`. 
+
+```{r}
+target <- getTaskTargets(bc.task)
+tab <- as.numeric(table(target))
+#obtain inverse class frequencies for the weights
+w <- 1/tab[target] 
+mod <- train("classif.rpart", task = bc.task, weights = w)
+fancyRpartPlot(getLearnerModel(mod), sub = "")
+```
+
+Weights can also be useful as a means to grant more importance to recently collected data versus older data or to reduce the influence of outliers.
 
 
 
