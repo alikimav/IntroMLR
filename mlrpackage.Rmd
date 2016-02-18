@@ -206,7 +206,63 @@ getConfMatrix(preds2)
 
 For multiclass classification problems, the threshold is given by a named vector specifying the values by which each probability will be divided. 
 
+### Performance
+
+There are many available performance measures implemented in mlr but one can also create their own performance measures. For a particular prediction object, say `preds` calling `performance(preds)` will give the calculated performance measure. It is also possible to calculate the time needed to train the learner (passing `timetrain` as an argument - see below), the time needed to compute the prediction (`timepredict`) or both (`timeboth`). 
+
+To obtain a list of available measures suitable for a particular problem type or `task`, use the `listMeasures` argument. The function `getDefaultMeasure` shows the defaults for a particular learner or task.
+
+```{r}
+listMeasures("classif", properties = "classif.multi")
+getDefaultMeasure(bh.task)
+```
+
+The following piece of `R` code shows how to obtain the performance measure from the prediction object.
+
+```{r}
+n <- getTaskSize(bh.task)
+train.set <- seq(1, n, by = 2)
+test.set <- seq(1, n, by = 2)
+lrn <- makeLearner("regr.gbm", n.trees = 1000)
+mod <- train(lrn, task = bh.task, subset = train.set)
+preds <- predict(mod, task = bh.task, subset = test.set)
+performance(preds)
+```
+
+To change the performance measure, we can do so via the `measures` argument. It is possible to calculate several performance measures by passing them as a list.
+
+```{r}
+performance(preds, measures = medse)
+performance(preds, measures = list(mse, medse, mae))
+```
+
+It is a necessary requirement to pass the model or the task in order to calculate some performance measures. For instance, for `timetrain` calculations, the model also needs to be passed as ar argument.
+
+```{r}
+performance(preds, measures = timetrain, model = mod)
+```
+
+For clustering problems, the task is required.
+
+```{r}
+lrn <- makeLearner("cluster.kmeans", centers = 3)
+mod <- train(lrn, task = mtcars.task)
+preds <- predict(mod, task = mtcars.task)
+performance(preds, measures = dunn, task = mtcars.task)
+```
 
 
+As previously mentioned, the threshold for classification problems alters the sensitivity of the model and therefore affects performance. The command `generateThreshVsPerfData` used on the prediction object along with a performance measure (or a list of them) generates data on the learner performance versus the threshold. T
 
+```{r}
+lrn <- makeLearner("classif.lda", predict.type = "prob")
+n <- getTaskSize(sonar.task)
+train.set <- seq(1, n, by = 2)
+test.set <- seq (2, n, by = 2)
+mod <- train(lrn, task = sonar.task, subset = train.set)
+preds <- predict(mod, task = sonar.task, subset = test.set)
+performance(preds, measures = list(fpr, fnr, mmce))
+d <- generateThreshVsPerfData(preds, measures = list(fpr, fnr, mmce))
+plotThreshVsPerf(d)
+```
 
