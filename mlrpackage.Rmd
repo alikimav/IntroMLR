@@ -266,3 +266,88 @@ d <- generateThreshVsPerfData(preds, measures = list(fpr, fnr, mmce))
 plotThreshVsPerf(d)
 ```
 
+### Resampling
+
+Resampling strategies are often used to assess the performance of a learning algorithm by splitting the data into multiple training and test sets. Each training set is used to train a learner and each test set is reserved for predictions. We get the mean performance measure obtained by agreggating all individual performances. The `makeResampleDesc` function is used to choose the resampling strategy; the method argument can be set to one of cross-validation, leave-one-out cross-validation, repeated cross-validation, out-of-bag bootstrap, subsampling (a.k.a. *Monte-Carlo* cross-validation), and holdout. Additional arguments can be passed to the function depending on the chosen method. Once the resampling description is specified, we use the function `resample` to fit a model specified by a learner on a task, which calculates predictions and performance measures for all training and test sets as specified by the resampling description.
+
+```{r}
+rdesc <- makeResampleDesc("CV", iters = 3, stratify = TRUE)
+task <- makeClassifTask(data = iris, target = "Species")
+lrn <- makeLearner("classif.rpart")
+r <- resample(lrn, task, rdesc)
+r
+r$measures.test
+r$aggr
+r$measures.train
+```
+
+The `resample` function returns a list whose elements we can access using the `$` notation. In the above exmaple `r$measures.test` gives the performance on the 3 individual test sets (as specified in the resampling description) and `r$measures.train` returns missing values since no predictions on the training sets were made. If we wish to have predictions on the training sets we can set `predict = "both"` or `predict = "train"` as an argument in `makeResampleDesc`. 
+
+Next, we can access `r$pred$data` which gives a data frame of the predictions and true (in supervised learning) values of the target variable. Note that it is possible to pass multiple measures as a list in `resample` (including `timetrain`). 
+
+```{r}
+head(r$pred$data)
+```
+
+*Stratified resampling* ensures that the same proportion of the classes falls in all partitions of the data such that, in a classification setting, each training/test set trains a model with no class being under-represented. This is especially important in small data sets as well as imbalanced classification problems. The `stratify = TRUE` argument is passed when making the resampling description (as in the `R` code above). The `stratify.cols = <col. name>` argument is used to stratify factor variable inputs to ensure that all subgroups are represented in the data partitions.
+
+#### Accessing individual learners
+
+By default, `resample` does not return the individual learners but can do so by passing the argument `models = TRUE` when calling `resample`. More useful still, is to extract certain information from each model like, for instance, the variable importance for chosen models. This is achieved via the `extract` argument.
+
+```{r}
+rdesc <- makeResampleDesc("CV", iters = 3)
+lrn <- makeLearner("regr.rpart")
+r <- resample(lrn, task = bh.task, resampling = rdesc, extract = function(x)
+  x$learner.model$variable.importance, models = FALSE)
+r$extract
+```
+
+Now, `r$extract` is going to give information on the given function from which we asked to obtain the variable importance. With `models = FALSE` we do not obtain other information on the model so attempting to call `getLearnerModel(r$models[[1]])` would return an error. 
+
+#### Resample instance
+
+The command `makeResampleInstance` takes as arguments an object of class ResampleDesc and a task [or the size of the data set i.e. nrow(<data>)]. This creates a ResampleInstance object which mainly stores the indices of the training and test sets used in each iteration. This feature may be useful in situations where we want to perform paired experiments like testing the performance of several learners on exactly the same data. 
+
+```{r}
+rdesc <- makeResampleDesc("CV", iters = 3, stratify = TRUE)
+rin <- makeResampleInstance(rdesc, task = iris.task)
+rin$train.inds[[2]]
+```
+
+In `makeResampleInstance` the indices are drawn randomly; the function `makeFixedHoldoutInstance` allows the training and test sets to be specified manually. 
+
+```{r}
+rin <- makeFixedHoldoutInstance(train.inds = 1:100, test.inds = 101:150, size = 150)
+rin
+```
+
+In resampling startegies, we get a performance measure which is aggregated over all the measures calculated for each iteration. By default, the aggregated score is the mean error on the test set. We can change the aggregation method for a measure via `setAggregation(measure, aggr)`. For the different options for `measure` and `aggr` type `?measures` and `?aggregations`, respectively. 
+
+```{r}
+m1 <- mmce
+m2 <- setAggregation(tpr, test.median) # tpr = true positive rate
+rdesc <- makeResampleDesc("CV", iters = 3)
+r <- resample("classif.rpart", task = sonar.task, resampling = rdesc, measures = list(m1,m2))
+r$aggr
+```
+
+To get predictions on both training and test sets, we need to set `predict = "both"` in `makeResampleDesc` and set the aggregation method to `train.mean` if we wish to calculate the mean. An example is shown below.
+
+```{r}
+train.mmce <- setAggregation(mmce, train.mean)
+rdesc <- makeResampleDesc("CV", iters = 3, predict = "both")
+r <- resample("classif.rpart", task = sonar.task, resampling = rdesc, measures = list(mmce, train.mmce))
+r$aggr
+```
+
+There exist functions which act as convenience wrappers for the various existing resampling strategies. They don't offer as much flexibility as `resample` but can be quick and useful if trying out a number of learners initially. An example with `crossval` is shown below.
+
+```{r}
+cviris <- crossval("classif.lda", task = iris.task, iters = 3, measures = list(mmce, ber))
+cviris
+```
+
+
+
+
