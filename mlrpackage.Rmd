@@ -6,12 +6,17 @@ output: html_document
 To become familiar with the mlr package and its widespread functionality, I created an Rmarkdown document with basic and advanced features from the mlr tutorial on mostly regression and classification problems with data available in R. 
 
 ```{r, echo=FALSE, message=FALSE}
+library(dplyr)
+library(caret)
 library(mlr)
 library(randomForest)
 library(gbm)
 library(mlbench)
 library(rattle)
 library(parallelMap)
+library(RWeka)
+library(kernlab)
+library(irace)
 ```
 ## Getting started
 
@@ -128,7 +133,7 @@ Once we create the task from the data set and identify the learning algorithm, t
 ```{r}
 task <- makeClassifTask(data = iris, target = "Species")
 lrn <- makeLearner("classif.lda")
-mod <- train(lrn, task)
+mod <- mlr::train(lrn, task)
 mod
 ```
 
@@ -139,7 +144,7 @@ data(BostonHousing, package = "mlbench")
 task <- makeRegrTask(data = BostonHousing, target = "medv")
 lrn <- makeLearner("regr.lm")
 train.set <- sample(getTaskSize(task), size = getTaskSize(task)/3)
-mod <- train(lrn, task, subset = train.set)
+mod <- mlr::train(lrn, task, subset = train.set)
 getLearnerModel(mod)
 ```
 
@@ -150,7 +155,7 @@ target <- getTaskTargets(bc.task)
 tab <- as.numeric(table(target))
 #obtain inverse class frequencies for the weights
 w <- 1/tab[target] 
-mod <- train("classif.rpart", task = bc.task, weights = w)
+mod <-mlr:: train("classif.rpart", task = bc.task, weights = w)
 fancyRpartPlot(getLearnerModel(mod), sub = "")
 ```
 
@@ -165,7 +170,7 @@ n <- getTaskSize(bh.task)
 train.set <- seq(1, n, by = 2)
 test.set <- seq(2, n, by = 2)
 lrn <- makeLearner("regr.gbm", n.trees = 100, interaction.depth = 4)
-mod <- train(lrn, bh.task, subset = train.set)
+mod <- mlr::train(lrn, bh.task, subset = train.set)
 preds <- predict(mod, task = bh.task, subset = test.set)
 preds
 ```
@@ -181,7 +186,7 @@ For classification problems, class labels are predicted. We can obtain a confusi
 
 ```{r}
 lrn <- makeLearner("classif.rpart", predict.type = "prob")
-mod <- train(lrn, iris.task)
+mod <- mlr::train(lrn, iris.task)
 preds <- predict(mod, newdata = iris)
 head(as.data.frame(preds))
 head(getPredictionProbabilities(preds))
@@ -194,7 +199,7 @@ data(Sonar)
 table(Sonar$Class)
 getTaskDescription(sonar.task)$positive
 lrn <- makeLearner("classif.rpart", predict.type = "prob")
-mod <- train(lrn, task = sonar.task)
+mod <- mlr::train(lrn, task = sonar.task)
 # predict with default threshold
 preds <- predict(mod, sonar.task)
 preds$threshold
@@ -225,7 +230,7 @@ n <- getTaskSize(bh.task)
 train.set <- seq(1, n, by = 2)
 test.set <- seq(1, n, by = 2)
 lrn <- makeLearner("regr.gbm", n.trees = 1000)
-mod <- train(lrn, task = bh.task, subset = train.set)
+mod <- mlr::train(lrn, task = bh.task, subset = train.set)
 preds <- predict(mod, task = bh.task, subset = test.set)
 performance(preds)
 ```
@@ -247,7 +252,7 @@ For clustering problems, the task is required.
 
 ```{r}
 lrn <- makeLearner("cluster.kmeans", centers = 3)
-mod <- train(lrn, task = mtcars.task)
+mod <- mlr::train(lrn, task = mtcars.task)
 preds <- predict(mod, task = mtcars.task)
 performance(preds, measures = dunn, task = mtcars.task)
 ```
@@ -260,7 +265,7 @@ lrn <- makeLearner("classif.lda", predict.type = "prob")
 n <- getTaskSize(sonar.task)
 train.set <- seq(1, n, by = 2)
 test.set <- seq (2, n, by = 2)
-mod <- train(lrn, task = sonar.task, subset = train.set)
+mod <- mlr::train(lrn, task = sonar.task, subset = train.set)
 preds <- predict(mod, task = sonar.task, subset = test.set)
 performance(preds, measures = list(fpr, fnr, mmce))
 d <- generateThreshVsPerfData(preds, measures = list(fpr, fnr, mmce))
@@ -565,7 +570,7 @@ We have already seen various `generate` functions within mlr which generate data
 ```{r}
 lrn <- makeLearner("classif.lda", predict.type = "prob")
 n <- getTaskSize(sonar.task)
-mod <- train(learner = lrn, task = sonar.task, subset = seq(1, n, by = 2))
+mod <- mlr::train(learner = lrn, task = sonar.task, subset = seq(1, n, by = 2))
 pred <- predict(mod, task = sonar.task, subset = seq(2, n, by = 2))
 d <- generateThreshVsPerfData(pred, measures = list(fpr, fnr, mmce))
 head(d$data)
@@ -589,3 +594,500 @@ plt <- plotPartialPrediction(pd)
 head(plt$data)
 plt
 ```
+
+
+## Advanced
+
+### Wrappers
+
+#### Introductory example
+
+It is possible to add pre-processing, missing values imputation, tuning, feature selection and other functionality to a learner through the use of wrappers. Each time a wrapper is used around an mlr learner, a new learner is returned and this procedure can be repeated many times.
+
+As a first example we use a bagging wrapper to create a random forest which supports weights and compare it to the unwrapped learner (`base.lrn` below). 
+
+```{r}
+data(iris)
+task <- makeClassifTask(data = iris, target = "Species", weights = as.integer(iris$Species))
+base.lrn <- makeLearner("classif.rpart")
+```
+
+The `makeBaggingWrapper` function takes as inputs the learner we want wrapped, the number of iterations which is the number of fitted models in bagging (for `rpart` learner, this would be `ntree` = N base learners), an option for sampling with/without replacement, proportion of randomly selected features (this would be the equivalent of `mtry`, here we set it at .5)
+
+```{r}
+wrapped.lrn <- makeBaggingWrapper(learner = base.lrn, bw.iters = 100, bw.feats = 0.5 )
+print(wrapped.lrn)
+```
+
+Next, we run a `benchmark` experiment with the list of learners comprised of the base and wrapped learners. Note that the default resampling strategy is 10-fold cross-validation.
+
+```{r}
+bmr <- benchmark(learners = list(base.lrn, wrapped.lrn), task = task)
+bmr
+```
+
+We may choose to carry out hyperparameter tuning to hopefully improve on the performance of the new learner. The function `makeTuneWrapper` fuses a learner with a search strategy to select its hyperparameters. This is set in effect when `train` is called (see below). First the algorithm for the hyperparameter optimization must be chosen - this is done via the `makeTuneControl` functions. A grid algorithm is traditional but it may be computationally expensive in high-dimensional spaces. In this example we only explore a small parameter space (we tune `minsplit` and `bw.feats`) with *random search*. The `minsplit` parameter is the minimum number of observations that must exist in a node in order for a split to be attempted and `bw.feats` was discussed above. In the random search, we choose to have sampled settings randomly selected 10 times (`maxit = 10`)
+
+```{r}
+ctrl <- makeTuneControlRandom(maxit = 10)
+rdesc <- makeResampleDesc("CV", iters = 3)
+par.set <- makeParamSet(makeIntegerParam("minsplit", lower = 1, upper = 10),
+                        makeNumericParam("bw.feats", lower = 0.25, upper = 1))
+
+tuned.lrn <- makeTuneWrapper(learner = wrapped.lrn, resampling = rdesc,
+                             measures = mmce, par.set = par.set, control = ctrl)
+print(tuned.lrn)
+```
+
+Now we have a learner object like before but this learner internally used `tuneParams` such as when called with `train`, the search strategy and resampling are invoked to choose an optimal set of parameters. The output from `train` is a tuned, bagged learner. 
+
+```{r}
+lrn <- mlr::train(learner = tuned.lrn, task = task)
+print(lrn)
+getTuneResult(lrn)
+```
+
+
+#### Data preprocessing
+
+The mlr package offers many options for data preprocessing. Some of them are directly applied to a task to modify it. These include `capLargeValues`, `createDummyFeatures` (for factor variables), `dropFeatures`, `joinClassLevels`, `mergeSmallFactorLevels`, `normalizeFeatures`, `removeConstantFeatures`, and `subsetTask` which are all pretty self explanatory from their name. 
+
+With the mlr wrapper functionality, the preprocessing steps are done at the time the learner is trained or predictions are made. This is important as it avoids the mistake of integrating processing steps which are data-dependent on the whole data set while the learner is trained only on training/test sets. A more honest performance of the learner is obtained if all preprocessing steps are included in the resampling. This is automatically done when fusing a learner with preprocessing. 
+
+`makePreprocWrapperCaret` permits access to all preprocessing options offered by `caret`'s `preProcess` function while`makePreprocWrapper` is used when writing custom preprocessing methods by defining the actions to be taken before training and before prediction. With these two functions, the preprocessing steps then belong to the learner. This is in contrast to the functions defined above (e.g `normalizeFeatures`) which alters the task. So, here, the task remains unchanged, preprocessing is done for every pair of training/test sets in resampling and not globally on the whole data set, and any parameters pertinent to preprocessing can be tuned with the learner's parameters. 
+
+Firstly, the usage of`makePreprocWrapperCaret` is similar to `caret`'s `preProcess` in the sense that it takes almost all of the formal arguments though their names are prefixed by `ppc.`, e.g. `knnImpute` becomes `ppc.knnImpute`. Secondly, there is no `method` argument; instead, the preprocessing options are passed as individual logical arguments, i.e. `pcc.knnImpute = TRUE`. 
+
+For knn imputation and pca in caret:
+
+`preProcess(x, method = c("knnImpute", "pca"), pcaComp = 10)`
+
+With the mlr wrapper:
+
+`makePreprocWrapperCaret(learner, ppc.knnImpute = TRUE, ppc.pca = TRUE, ppc.pcaComp = 10)`
+
+We show an example where we apply PCA on the sonar data (this poses a binary classification problem with 208 obs and 60 features) for dimensionality reduction. The `makePreprocWrapperCaret` function below is used to fuse quadratic discriminant analysis with PCA preprocessing where we set the threshold for PCA to retain 90 \% (cumulative percent) of variance. Note that the data is automatically standardized prior to applying PCA.
+
+```{r}
+lrn <- makePreprocWrapperCaret(learner = "classif.qda", ppc.pca = TRUE, ppc.thresh = 0.9)
+lrn
+```
+
+Now, that we have a wrapped learner, calling `train` with the task will train with the principal components returned after PCA has been applied.
+
+```{r}
+mod <- mlr::train(lrn, sonar.task)
+mod$learner.model
+# or, for more info:
+getLearnerModel(model = mod, more.unwrap = TRUE)
+```
+
+Finally, we carry out a benchmark experiment to explore whether preprocessing with PCA has improved the performance of qda. We choose `stratify = TRUE` in resampling due to each class being represented by a small number of observations.
+
+```{r}
+rin <- makeResampleInstance("CV", iters = 3, stratify = TRUE, task = sonar.task)
+bmr <- benchmark(learners = list(makeLearner("classif.qda"), lrn), tasks = sonar.task, resamplings = rin, show.info = FALSE)
+bmr
+```
+
+So far so good; it seems that PCA preprocessing is beneficial for the qda. However, the `thresh` value was chosen somewhat arbitrarily and resulted in 22 principal components. Perhaps with further tuning of the parameter, we can improve the performance of qda. Preprocessing and learner parameters can be tuned jointly. Calling `getParamSet` on the wrapped learner gives us all options.
+
+```{r}
+getParamSet(lrn)
+```
+
+In what follows, we tune the number of principal components (instead of `ppc.thresh`) and we try two different ways to estimate the posterior probabilities in qda: *plug-in estimates* and *unbiased estimates*. This is controled via the `predict.method` parameter. The hyperparameter tuning is done via a *grid search* this time with a resolution of 10 (consider finer resolutions in real problems).
+
+```{r}
+ps <- makeParamSet(
+  makeIntegerParam("ppc.pcaComp", lower = 1, upper = getTaskNFeats(sonar.task)),
+  makeDiscreteParam("predict.method", values = c("plug-in", "debiased"))
+)
+
+ctrl <- makeTuneControlGrid(resolution = 10)
+res <- tuneParams(lrn, sonar.task, rin, par.set = ps, control = ctrl, show.info = FALSE)
+res
+```
+
+The following example shows how to create a custom preprocessing wrapper using `makePreprocWrapper` which adds a scaling option to a learner by coupling it with the function `scale` (note this is actually possible through `makePreprocWrapperCaret`). Since wrappers are implemented using a *train* and *predict* method, we specify custom train and predict functions. The *train* function has to return a list with the preprocessed data set (`$data`) and an element which stores the information required to preprocess the data before prediction (`$control`). In our example, `$control` stores the scaling parameters which are to be used in the prediction.
+
+```{r}
+trainfun <- function(data, target, args = list(center, scale)){
+  cns <- colnames(data)
+  # identify num data - exclude target
+  nums <- setdiff(cns[sapply(data, is.numeric)], target) 
+  # extract numerical feats
+  x <- as.matrix(data[, nums, drop = FALSE])
+  x <- scale(x, center = args$center, scale = args$scale)
+  # store the scaling parameters in control, needed to preprocess the data before preds.
+  control <- args
+  if (is.logical(control$center) && control$center)
+    control$center = attr(x, "scaled:center")
+  if (is.logical(control$scale) && control$scale)
+    control$scale = attr(x, "scaled:scale")
+  # recombine the data
+  data <- data[, setdiff(cns, nums), drop = FALSE]
+  data <- cbind(data, as.data.frame(x))
+  return(list(data = data, control = control))
+}
+```
+
+Next, the *predict* function takes in the data (without target variable), the name of the target variable, the`args` that were passed to `trainfun` and the `control` object returned by `trainfun`. 
+
+```{r}
+predictfun <- function(data, target, args, control){
+  cns <- colnames(data)
+  nums <- cns[sapply(data, is.numeric)]
+  x <- as.matrix(data[, nums, drop = FALSE])
+  x <- scale(x, center = control$center, scale = control$scale)
+  data <- data[, setdiff(cns, nums), drop = FALSE]
+  data <- cbind(data, as.data.frame(x))
+  return(data)
+}
+```
+
+Now we are going to use the functions we specified in a preprocessing wrapper. We use a regression neural network which does not have a scaling option and couple it with our own center + scale. 
+
+```{r}
+lrn <- makeLearner("regr.nnet", trace = FALSE, decay = 1e-02)
+lrn <- makePreprocWrapper(lrn, train = trainfun, predict = predictfun, 
+                          par.vals = list(center = TRUE, scale = TRUE))
+lrn
+```
+
+
+We now compare the performance of a `nnet` with and without scaling using the cross-validated mean squared error as a measure.
+
+```{r}
+rdesc <- makeResampleDesc("CV", iters = 3)
+r <- resample(lrn, bh.task, rdesc, measures = mse, show.info = FALSE)
+r
+```
+
+And without scaling.
+
+```{r}
+lrn <- makeLearner("regr.nnet", trace = FALSE, decay = 1e-02)
+r <- resample(lrn, bh.task, rdesc, measures = mse, show.info = FALSE)
+r
+```
+
+#### Joint tuning of preprocessing and learner parameters
+
+Usually we have some idea of what preprocessing we want to apply but it's not clear what options work best for each algorithm. It is possible to tune the preprocesssing and learner parameters as we have previously done.
+
+```{r}
+lrn <- makeLearner("regr.nnet", trace = FALSE)
+lrn <- makePreprocWrapper(lrn, train = trainfun, predict = predictfun, 
+                          par.set = makeParamSet(
+                            makeLogicalLearnerParam("center"),
+                            makeLogicalLearnerParam("scale")
+                          ),
+                          par.vals = list(center = TRUE, scale = TRUE)
+                          )
+lrn
+getParamSet(lrn)
+```
+
+We now tune via a grid search the decay parameter for the learner as well as the center and scale parameters for the preprocessing.
+
+```{r}
+rdesc <- makeResampleDesc("Holdout")
+ps <- makeParamSet(
+  makeLogicalParam("center"),
+  makeLogicalParam("scale"),
+  makeDiscreteParam("decay", c(0, 0.05, 0.1))
+)
+ctrl <- makeTuneControlGrid()
+res <- tuneParams(lrn, bh.task, rdesc, par.set = ps, control = ctrl, show.info = FALSE)
+res
+as.data.frame(res$opt.path)
+```
+
+### Imputation of missing values
+
+In the mlr package, methods of imputation of missing values include imputation by a constant (mean, median, mode or some other constant), random numbers (some distribution), or based on predictions by a supervised learner. The possibility of custom imputation methods is also available. Note that some of the learning algorithms in mlr which have the `missings` property integrated, can deal with missing values in a sensible way (i.e. not simply deleting observations). Typing `listLearners("regr", properties = "missings")[c("class", "package")]` will give info on those packages if they are installed.
+
+We first look at a simple example making use of the function `impute` on the `airquality` data set. To further demonstrate the functionality of `impute`, we add some missing values in the `Wind` column and then coerce into a factor using `cut`.
+
+```{r}
+data("airquality")
+airq <- airquality
+ind <- sample(nrow(airquality), 10)
+airq$Wind[ind] <- NA
+airq$Wind <- cut(airq$Wind, c(0, 8, 16, 24))
+summary(airq)
+sapply(airq, class)
+```
+
+The `Ozone` and `Solar.R` variables are of class integer and the `Wind` variable is of class factor. We choose to impute the integer features by the mean and the factor feature by the mode. We also choose to create dummy variables for all integer features indicating which observations were missing. 
+
+```{r}
+imp <- impute(airq, classes = list(integer = imputeMean(), factor = imputeMode()), dummy.classes = "integer")
+head(imp$data)
+```
+
+The function `impute` returns an object with the elements `$data` and `$desc`; the latter stores the information for the imputation. Note that "Imputed" refers to the class of features for which an imputation method was specified (here, 5 integers + 1 factor) and not the features which contain NA values. Here, the target variable was not specified. Next, let us look at a learning task example where the target variable is involved. In the `airquality` data set, we wish to predict the ozone pollution based on meteorological features. Our dataset therefore will have 4 columns: `Ozone`, `Solar.R`, `Wind`, and `Temp`.
+
+```{r}
+# prepare data set
+# remove Day and Month 
+airq <- dplyr::select(airq, -c(Day, Month))
+# choose first 100 obs to make up the training set
+airq.train <- airq[1:100, ]
+airq.test <- airq[-c(1:100), ]
+```
+
+In this example, we do the following:
+
+1) impute missing values in `Solar.R` with random numbers drawn from an empirical distribution;
+
+2) Use function `imputeLearner`, which allows the user to use all supervised learning algorithms integrated in mlr, to impute missing values in the factor variable `Wind`. With `imputeLearner`, we need to create a learner whose type must match the variable to be imputed. So, here we go for `classif.<learning_algorithm>` since our feature variable is a factor. Then, all columns apart from the one imputed and the target variable are used as features in the learning algorithm chosen. Note that there are algorithms that can deal with missing values so in our example, to impute `NA`'s in `Wind` using say, a classification tree, only `Temp` and `Solar.R` will be used as features in the tree. The `rpart` algorithm will be able to handle the missing values in `Solar.R`. 
+
+```{r}
+imp <- impute(data = airq.train, target = "Ozone", cols = list(Solar.R = imputeHist(), Wind = imputeLearner(makeLearner("classif.rpart"))), dummy.cols = c("Solar.R", "Wind"))
+imp$desc
+summary(imp$data)
+```
+
+To impute the test data the same way as the train data, we can simply use the `imp$desc` object with the function `reimpute`.
+
+```{r}
+airq.test.imp <- reimpute(airq.test, desc = imp$desc)
+head(airq.test.imp)
+```
+
+#### Fuse a learner with imputation
+
+When creating a learner with `makeImputeWrapper`, before training the resulting learner, impute is applied to the training set and, subsequently, before prediction, `reimpute` is called on the test set using the `$desc` object from the training stage. In what follows, we ask for the same imputation as above and we choose a linear regression model as the learner.
+
+```{r}
+lrn <- makeImputeWrapper(learner = "regr.lm", cols = list(Solar.R = imputeHist(), Wind = imputeLearner(makeLearner("classif.rpart"))), dummy.cols = c("Solar.R", "Wind")
+                         )
+lrn
+```
+
+To create a task, we need to delete any observations from the target variable (`Ozone`) which are missing. 
+
+```{r}
+airq <- subset(airq, subset = !is.na(airq$Ozone))
+task <- makeRegrTask(data = airq, target = "Ozone")
+rdesc <- makeResampleDesc("CV", iters = 4)
+r <- resample(lrn, task, rdesc, show.info = FALSE, models = TRUE)
+r$aggr
+```
+
+```{r}
+lapply(r$models, getLearnerModel, more.unwrap = TRUE)
+```
+
+Note that `makePreprocWrapperCaret` is also available for fusion with imputation and a learner but it is somewhat limited. 
+
+### Generic Bagging
+
+With `makeBaggingWrapper`, it is possible to bag an mlr learner to use bagging as a technique to gain more stability. The `makeBaggingWrapper` function takes arguments which decide on the subsets to be chosen for each iteration of the bagging process. So, just like in `randomForest`, we need to train a learner on a subset of data.
+
+- `bw.iters`: the number of subsets (samples) we want to train our learner
+- `bw.replace`: logical. sample with replacement (bootstrapping) or without
+- `bw.size`: percentage size of sampled bags
+- `bw.feats`: percentage size of randomly selected features in bags
+
+In the example below, we compare the performance of a pruned tree (using `RWeka`'s `PART`) with and without bagging on the `Sonar` data.
+
+```{r}
+lrn <- makeLearner("classif.rpart")
+bag.lrn <- makeBaggingWrapper(lrn, bw.iters = 50, bw.replace = TRUE, bw.size = 0.8, bw.feats = 3/4)
+rdesc <- makeResampleDesc("CV", iters = 5)
+r <- resample(learner = lrn, task = sonar.task, resampling = rdesc, show.info = FALSE)
+r$aggr
+rdesc <- makeResampleDesc("CV", iters = 5)
+r2 <- resample(learner = bag.lrn, task = sonar.task, resampling = rdesc, show.info = FALSE)
+r2$aggr
+```
+
+#### Changing the type of prediction
+
+Using `setPredictType`, we can change the type of prediction. For classification problems we can either have labels (these are determined by majority voting over the preductions of the individual models) or posterior class probabilities. Note that the predict type for the base learner always has to be "response". 
+
+```{r}
+bag.lrn <- setPredictType(bag.lrn, predict.type = "prob")
+```
+
+In the case of a regression problem, the options for prediction type are numeric, response or standard errors.
+
+```{r}
+n <- getTaskSize(bh.task)
+train.inds <- seq(1, n, 3)
+test.inds <- setdiff(1:n, train.inds)
+lrn <- makeLearner("regr.rpart")
+bag.lrn <- makeBaggingWrapper(learner = lrn) # using defaults for the rest
+bag.lrn <- setPredictType(bag.lrn, predict.type = "se")
+mod <- mlr::train(bag.lrn, bh.task, subset = train.inds)
+head(getLearnerModel(mod), 2)
+```
+
+Next we predict the response and calculate the standard deviation for each prediction:
+
+```{r}
+pred <- predict(mod, task = bh.task, subset = test.inds)
+head(as.data.frame(pred))
+```
+
+We can then plot the percentage of lower status of the population against the predicted response (predicted `medv`) with its calculated standard errors using `ggplot2`. 
+
+```{r}
+data <- cbind(as.data.frame(pred), getTaskData(bh.task, subset = test.inds))
+g <- ggplot(data, aes(x = lstat, y = response, ymin = response - se, ymax = response + se), col = age)
+g + geom_point() + geom_linerange(alpha = 0.5)
+```
+
+### Tuning
+
+We can set selected hyperparameters in machine learning algorithms by passing them on to `makeLearner`. By tuning the hyperparameters, we can automatically identify values that lead to the best performance. In order to do the tuning, we need to specify the *search space*, the *optimization algorithm*, and the *evaluation method* (i.e. a resampling strategy + a performance measure).
+
+#### Grid search
+
+1. Create the `ParamSet` object which describes the parameter space we want to search.
+
+```{r}
+ps <- makeParamSet(
+  makeDiscreteParam("C", values = 2^(-2:2)),
+  makeDiscreteParam("sigma", values = 2^(-2:2))
+)
+```
+
+2. Create the `TuneControl` object which describes the optimization strategy to be used and its settings.
+
+```{r}
+ctrl <- makeTuneControlGrid()
+```
+
+3. Create the resampling description.
+
+```{r}
+rdesc <- makeResampleDesc("CV", iters = 3L)
+```
+
+4. Tuning the parameters with `tuneParams`.
+
+```{r}
+result <- tuneParams("classif.ksvm", task = iris.task, resampling = rdesc, par.set = ps, control = ctrl)
+result
+```
+
+The `show.info` argument can be set via `configureMlr`; the command `getMlrOptions()` shows the current settings. In the aboce example, `tuneParams` 
+performs cross-validation for every element of the cross product (so in this case, we have 5 x 5 different combinations). The optimal parameters (which give the best mean performance) are selected in the end. In the example above, since no measure was selected, the default for classification was used (`mmce`). Alternatively, we can set a different measure; this is shown below.
+
+```{r}
+result <- tuneParams("classif.ksvm", task = iris.task, resampling = rdesc, par.set = ps, control = ctrl, measures = list(acc, setAggregation(acc, test.sd)), show.info = FALSE)
+result
+```
+
+The object returned by `tuneParams` is a list which includes the best parameter settings (accessed via `$x`) and their estimated performance (accessed via `$y`). Through `$opt.path`, we can obtain the performance of all points evaluated.
+
+```{r}
+opt.grid <- as.data.frame(result$opt.path)
+opt.grid
+```
+
+Further, we can visualize a selected performance measure using `geom_tile()` from `ggplot2`. In the code below, we ask for the color of the tiles to represent the achieved accuracy while the labels on the tiles represent the standard deviation for each of the settings attempted.
+
+```{r}
+g <- ggplot(opt.grid, aes(x = C, y = sigma, fill = acc.test.mean, label = round(acc.test.sd, 3)))
+g + geom_tile() + geom_text(color = "white")
+```
+
+#### Using the optimal parameters
+
+Once we have the optimal hyperameter set, we generate a learner and pass the settings as an argument in `setHyperPars`.
+
+```{r}
+lrn <- setHyperPars(makeLearner("classif.ksvm"), par.vals = result$x)
+mod <- mlr::train(learner = lrn, task = iris.task)
+predict(mod, task = iris.task)
+```
+
+Above, we used `mkeDiscreteParam` to discretize manually the parameters we wanted to set (here, `C` and `sigma`). We can also use their true numeric value and set `resolution = TRUE` in the control strategy to automatically discretize them. When setting the numerical parameter range, we can also pass a transformation function (`trafo`).
+
+```{r}
+ps <- makeParamSet(
+  makeNumericParam("C", lower = 12, upper = 12, trafo = function(x) 2^x),
+  makeNumericParam("sigma", lower = -12, upper = 12)
+)
+ctrl <- makeTuneControlGrid(resolution = 3L)
+rdesc <- makeResampleDesc("CV", iters = 2L)
+res <- tuneParams("classif.ksvm", task = iris.task, resampling = rdesc, par.set = ps, control = ctrl)
+res 
+```
+
+Note that calling `res$opt.path` as before returns the parameter values on the original scale before the transformation applied as set in the `trafo` option. The transformed parameters can be retrieved using `trafoOptPath`, as shown below.
+
+```{r}
+# original scale
+as.data.frame(res$opt.path)
+# transformed
+as.data.frame(trafoOptPath(res$opt.path))
+```
+
+The mlr package supports additional tuning algorithms to the traditional grid. In previous parts of this tutorial, we used `makeTuneControlRandom` which uses random search. An iterated F-racing algorithm is also included; the algorithm starts by considering a set of candidate parameters and completely discards any for which any statistical evidence arises against them. We show an example below with the `iris.task`. In this example, we experiment with different kernels in the svm algorithm. However, we wish to tune certain parameters with particular kernels; we can set this using the `requires` argument which states requirements on other parameters. For instance, below we make `sigma` and `degree` dependent on `rbfdot` and `polydot` kernels, respectively.
+
+```{r}
+ps <- makeParamSet(
+  makeNumericParam("C", lower = -12, upper = 12, trafo = function(x) 2^x),
+  makeDiscreteParam("kernel", values = c("vanilladot", "polydot", "rbfdot")),
+  makeNumericParam("sigma", lower = -12, upper = 12, trafo = function(x) 2^x, 
+                   requires = quote(kernel == "rbfdot")),
+  makeIntegerParam("degree", lower = 2L, upper = 5L, 
+                   requires = quote(kernel == "polydot"))
+)
+ctrl <- makeTuneControlIrace(maxExperiments = 200L)
+rdesc <- makeResampleDesc("Holdout")
+res <- tuneParams(learner = "classif.ksvm", task = iris.task, resampling = rdesc, par.set = ps, control = ctrl, show.info = FALSE)
+head(as.data.frame(res$opt.pat))
+res
+head(as.data.frame(res$opt.path))
+```
+
+#### One step further with ModelMultiplexer
+
+We can tune over different models at the same time and set parameters for each model using `makeModelMultiplexerParameterSet`. Once more we look at the `iris.task` classification problem set and tune SVM and randomForest algorithms at the same time. 
+
+```{r}
+base.learners <- list(
+  makeLearner("classif.ksvm"),
+  makeLearner("classif.randomForest")
+)
+lrn <- makeModelMultiplexer(base.learners)
+ps <- makeModelMultiplexerParamSet(lrn,
+       makeNumericParam("sigma", lower = -12, upper = 12, trafo = function(x) 2^x),
+       makeIntegerParam("ntree", lower = 1L, upper = 500L)
+       )
+rdesc <- makeResampleDesc("CV", iters = 2L)
+ctrl <- makeTuneControlIrace(maxExperiments = 200L)
+res <- tuneParams(lrn, iris.task, rdesc, par.set = ps, control = ctrl, show.info = FALSE)
+res
+```
+
+#### Control structures for multi-criteria tuning
+
+It is possible that we may want to optimize multiple performance measures simultaneously when tuning parameters. The mlr package offers multi-criteria tuning algorithms as control structures which are then passed onto `tuneParamsMultiCrit`. As an example, we tune SVM hyperparameters on the `sonar.task` classification task where we aim to optimize both `fpr` and `fnr`. 
+
+```{r}
+ps <- makeParamSet(
+  makeNumericParam("C", lower = -12, upper = 12, trafo = function(x) 2^x),
+  makeNumericParam("sigma", lower = -12, upper = 12, trafo = function(x) 2^x)
+)
+
+ctrl <- makeTuneMultiCritControlRandom(maxit = 30L)
+rdesc <- makeResampleDesc("Holdout")
+res <- tuneParamsMultiCrit("classif.ksvm", sonar.task, rdesc, measures = list(fpr, fnr), par.set = ps, control = ctrl, show.info = FALSE)
+res
+```
+
+In the case of nontrivial multi-objective optimization problems, the objective functions are said to be conflicting. This could potentially result in the existence of a large number of optimal solutions. Here, as hyperparameters are tuned, the `fpr` and `fnr` measures are calculated and recorded. A *Pareto improvement* is said to occur if, the tuning of a certain parameter set, improves the lot of at least one of the measures. A solution is concerned *Pareto efficient* if no further Pareto improvements can be made. The Pareto efficient solutions make the **Pareto front**. The number of points on the front is the result shown when calling the object of the `tuneParamsMultiCrit`. Finally, the optimal solutions can be accessed using `res$x` (for the parameter sets) and `res$y` (for the estimated performance measures). All solutions cab be visualized using `plotTuneMultiCritResult` with the solutions on the Pareto front shown as bigger points (note that some - if more than one - may completely overlap). 
+
+```{r}
+plotTuneMultiCritResult(res)
+```
+
+
