@@ -6,9 +6,9 @@ output: html_document
 To become familiar with the mlr package and its widespread functionality, I created an Rmarkdown document with basic and advanced features from the mlr tutorial on mostly regression and classification problems with data available in R. 
 
 ```{r, echo=FALSE, message=FALSE}
+library(plyr)
 library(dplyr)
 library(caret)
-library(mlr)
 library(randomForest)
 library(gbm)
 library(mlbench)
@@ -17,6 +17,7 @@ library(parallelMap)
 library(RWeka)
 library(kernlab)
 library(irace)
+library(mlr)
 ```
 ## Getting started
 
@@ -554,7 +555,7 @@ A number of instances are parallelizable with mlr. Parallelization is activated 
 parallelStartMulticore(cpus = 2) # better for macosx?
 rdesc <- makeResampleDesc("CV", iters = 3)
 r <- resample("classif.lda", task = iris.task, rdesc)
-parallelStop
+parallelStop()
 ```
 
 The `parallelStart` functions have an optional argument `levels`; by setting it, we can control which level gets parallelized. For instance, we may be running a few benchmark experiments which use an elaborate resampling description. In such a case, it would be best to have the resampling parallelized and not the benchmark so we could set `level = "mlr.resample"` in the `parallelStart` function. Not all levels are supported, the current version (2.8) supports `mlr.benchmark`, `mlr.resample`, `mlr.selectFeatures`, and `mlr.tuneParams`.
@@ -872,7 +873,7 @@ To create a task, we need to delete any observations from the target variable (`
 ```{r}
 airq <- subset(airq, subset = !is.na(airq$Ozone))
 task <- makeRegrTask(data = airq, target = "Ozone")
-rdesc <- makeResampleDesc("CV", iters = 4)
+rdesc <- makeResampleDesc("CV", iters = 3)
 r <- resample(lrn, task, rdesc, show.info = FALSE, models = TRUE)
 r$aggr
 ```
@@ -1052,7 +1053,7 @@ head(as.data.frame(res$opt.path))
 
 We can tune over different models at the same time and set parameters for each model using `makeModelMultiplexerParameterSet`. Once more we look at the `iris.task` classification problem set and tune SVM and randomForest algorithms at the same time. 
 
-```{r}
+```{r, message=FALSE}
 base.learners <- list(
   makeLearner("classif.ksvm"),
   makeLearner("classif.randomForest")
@@ -1072,7 +1073,7 @@ res
 
 It is possible that we may want to optimize multiple performance measures simultaneously when tuning parameters. The mlr package offers multi-criteria tuning algorithms as control structures which are then passed onto `tuneParamsMultiCrit`. As an example, we tune SVM hyperparameters on the `sonar.task` classification task where we aim to optimize both `fpr` and `fnr`. 
 
-```{r}
+```{r, message=FALSE}
 ps <- makeParamSet(
   makeNumericParam("C", lower = -12, upper = 12, trafo = function(x) 2^x),
   makeNumericParam("sigma", lower = -12, upper = 12, trafo = function(x) 2^x)
@@ -1089,5 +1090,176 @@ In the case of nontrivial multi-objective optimization problems, the objective f
 ```{r}
 plotTuneMultiCritResult(res)
 ```
+
+Note that tuning works similarly in tasks other than classification and see also later section on *nested resampling* for unbiased performance estimation.
+
+### Feature Selection
+
+The mlr package supports two different methods for feature selection which are discussed here in this section.
+
+#### Filter methods
+
+Filter methods assign the features a value of **importance** which allows a ranking of the features which allows to subsequent subsetting of features to be used in a learning algorithm. A number of methods are available for calculating feature importance for classification, regression, and survival tasks (current support). The method is passed as an argument in `generateFilterValuesData`; the default is `rf.importance`.
+
+```{r}
+fv <- generateFilterValuesData(task = iris.task, method = "information.gain")
+fv
+```
+
+A vector of methods can also be supplied to obtain feature importance values for each specified method.
+
+```{r}
+fv2 <- generateFilterValuesData(task = iris.task, method = c( "information.gain", "chi.squared"))
+fv2
+```
+
+And these can be visualized by passing the resulting object into `plotFilterValues`.
+
+```{r}
+plotFilterValues(fv2)
+```
+
+In this example, according to both measures, `Petal.Width` and `Petal.Length` contain the most information about the target variable `Species`. 
+
+Using this information, we can create a new task that includes a subset of the features specified by the user. To select the subset, we pass arguments to `filterFeatures`. We can choose from: `abs = K` where `K` is equal to some number of features to keep, `perc = r` where 0 < `r` < 1 is a percentage of the most important features to keep, and `threshold = m` where `m` denotes a threshold importance value (we keep features with values above `m`). In `filterFeatures`, we can either specify the method of calculating feature importance or, we can pass the object returned from `generateFilterValuesData` through the `fval` argument. 
+
+```{r}
+filtered.task <- filterFeatures(iris.task, method = "information.gain", abs = 2)
+
+filtered.task <- filterFeatures(iris.task, fval = fv, perc = 0.25)
+
+filtered.task <- filterFeatures(iris.task, fval = fv, threshold = 0.5)
+filtered.task
+```
+
+#### Fuse a learner with a filter method
+
+In an experiment with objectives to train a learner, we employ a resampling startegy to identify a validation method. Obviously feature selection is an important step contributing to the overall learner performance and we often want to carry out feature selection prior to each iteration identified in our resampling strategy. In what follows, we return the `iris.task` to train a fast k nearest neighbor classifier. The resampling strategy chosen is 10-fold cross-validation: in each iteration feature selection is applied via the filter method using `information.gain` as the measure and always keeping the 2 most important features.
+
+```{r, message=FALSE}
+lrn <- makeFilterWrapper(learner = "classif.fnn", fw.method = "information.gain", fw.abs = 2)
+rdesc <- makeResampleDesc("CV", iters = 10)
+r <- resample(lrn, iris.task, rdesc, show.info = FALSE, models = TRUE)
+r$aggr
+```
+
+By calling `models = TRUE`, we store information on the models which allows us to access information like the two selected features for each model trained. We use `getFilteredFeatures` on each of the model fitted.
+
+```{r}
+sfeats <- sapply(r$models, getFilteredFeatures)
+table(sfeats)
+```
+
+In this data set, the importance of `Petal.Length` and `Petal.Width` on `Species` seems to be very stable as they are consistently selected as the top 2 features. 
+
+#### Tuning the size of the feature subset
+
+Just as we tuned the hyperparameters of learning algorithms in the previous section, we can also tune the size of the feature subset. We pass on a control strategy and a range of values corresponding to the number/percentage of features or threshold into `tuneParams`.
+
+```{r}
+lrn <- makeFilterWrapper(learner = "regr.lm", fw.method = "chi.squared")
+ps <- makeParamSet(makeDiscreteParam("fw.perc", values = c(0.2, 0.5, 0.05)))
+rdesc <- makeResampleDesc("CV", iters  = 3)
+res <- tuneParams(lrn, bh.task, rdesc, par.set = ps, control = makeTuneControlGrid())
+res
+```
+
+The `$x`, `$y`, and `$opt.path` elements work as we have seen them before. We can pass the tuned parameter to generate a new wrapped learner for further use.
+
+
+```{r, message = FALSE}
+lrn <- makeFilterWrapper("regr.lm", fw.method = "chi.squared", fw.perc = res$x$fw.perc)
+mod <- mlr::train(lrn, bh.task)
+mod
+getFilteredFeatures(mod)
+```
+
+We show another example using the `sonar.task` classification problem and make use of the multi-criteria tuning functions we introduced in the last section.
+
+```{r, message = FALSE}
+lrn <- makeFilterWrapper("classif.lda", fw.method = "chi.squared")
+ps <- makeParamSet(makeNumericParam("fw.threshold", lower = 0.1, upper = 0.9))
+rdesc <- makeResampleDesc("CV", iters = 10)
+res <- tuneParamsMultiCrit(lrn, sonar.task, par.set = ps, resampling = rdesc, measures = list(fpr, fnr), control = makeTuneMultiCritControlRandom(maxit = 50), show.info = FALSE)
+res
+plotTuneMultiCritResult(res)
+```
+
+#### Wrapper methods
+
+In the previous subsection, feature selection was accomplished independently from the performance of a specific learning algorithm. We achieved optimal feature selection through maximizing or minimizing a criterion function. We now turn out attention to *wrapper* models where the effectiveness of the performance feature selection model is directly related to the performance of the learning algorithm, usually in terms of its predictive accuracy. Therefore, in the wrapper method, a learner is trained repeatedly on a different subset of features and the subset which leads to the learner with the best performance is chosen. To do this, we need to specify which strategy we want to use to identify the various subsets to be used. Of course we also need to choose a learning algorithm and a resampling strategy by which we aim to assess performance. 
+
+A note on the search strategy for feature selection. The mlr package offers 4 methods:
+
+1) `FeatSelControlExhaustive` : exhaustive search; all feature sets up to a certain number of `max.features` is searched.
+2) `FeatSelControlRandom`: random search; feature vectors randomly drawn up to a certain number of `max.features`. 
+3) `FeatSelControlSequential`: deterministic forward or backward search. Forward (backward) search starts with smaller (bigger) feature subsets and adds (removes) sequentially. 
+4) `FeatSelControlGA`: genetic algorithm. An adaptive search technique based on the analogy with biology in which a set of possible solutions evolves via natural selection.
+
+In the following example, we use the *Wisconsin Prognostic Breast Cancer* data set using a random search strategy.
+
+```{r}
+ctrl <- makeFeatSelControlRandom(maxit = 20L)
+ctrl
+rdesc <- makeResampleDesc("Holdout")
+sfeats <- selectFeatures(learner = "surv.coxph", task = wpbc.task, resampling = rdesc, control = ctrl, show.info = FALSE)
+sfeats
+```
+
+The selected features and corresponding performance are included in the object returned by `selectFeatures`.
+
+```{r}
+sfeats$x
+sfeats$y
+```
+
+We use the `bh.task` in a second example with forward sequential search. Features are added to the model until the performance improvement is smaller than some value (set by the `alpha` parameter). 
+
+```{r}
+ctrl <- makeFeatSelControlSequential(method = "sfs", alpha = 0.02)
+
+rdesc <- makeResampleDesc("CV", iters = 10)
+sfeats <- selectFeatures(learner = "regr.lm", task = bh.task, resampling = rdesc, control = ctrl, show.info = FALSE)
+sfeats
+```
+
+Details of the sequential feature selection process can be retrieved using `analyzeFeatSelResult`:
+
+```{r}
+analyzeFeatSelResult(sfeats)
+```
+
+#### Fuse a learner with a wrapper method
+
+Similarly to what we did above with fusing a learner with the filter, we can do so here with the wrapper. We fuse the feature selection and resampling strategies with a learner. The learner is trained on the selected feature subset.
+
+```{r}
+rdesc <- makeResampleDesc("CV", iters = 3)
+lrn <- makeFeatSelWrapper(learner = "surv.coxph", resampling = rdesc, control = makeFeatSelControlRandom(maxit = 10), show.info = FALSE)
+mod <- train(lrn, wpbc.task)
+mod
+sfeats <- getFeatSelResult(mod)
+sfeats
+sfeats$x
+```
+
+The 5-fold cross-validated performance of the learner we specified above can be computed through `resample`.
+
+```{r}
+out.rdesc <- makeResampleDesc("CV", iters = 5)
+
+r <- resample(learner = lrn, task = wpbc.task, resampling = out.rdesc, models = TRUE, show.info = FALSE)
+
+r$aggr
+```
+
+With `models = TRUE` in `resample`, we can access the feature selection for each model by applying `getFeatSelResult`.
+
+```{r}
+lapply(r$models, getFeatSelResult)
+```
+
+
+
 
 
