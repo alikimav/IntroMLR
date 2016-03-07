@@ -976,7 +976,7 @@ result <- tuneParams("classif.ksvm", task = iris.task, resampling = rdesc, par.s
 result
 ```
 
-The `show.info` argument can be set via `configureMlr`; the command `getMlrOptions()` shows the current settings. In the aboce example, `tuneParams` 
+The `show.info` argument can be set via `configureMlr`; the command `getMlrOptions()` shows the current settings. In the above example, `tuneParams` 
 performs cross-validation for every element of the cross product (so in this case, we have 5 x 5 different combinations). The optimal parameters (which give the best mean performance) are selected in the end. In the example above, since no measure was selected, the default for classification was used (`mmce`). Alternatively, we can set a different measure; this is shown below.
 
 ```{r}
@@ -1260,6 +1260,287 @@ lapply(r$models, getFeatSelResult)
 ```
 
 
+### Nested Resampling
 
+When we introduced *tuning*, we carry out the optimization over the same data. As a result, the estimated performance could be optimistically biased. To obtain an unbiased performance estimatation, we use **nested resampling**. In nested resampling, data preprocessing and feature selection is included in each training/test data resulting in an honest performance estimate. As an example consider a case where we want to train a learner with hyperparameter tuning. Suppose we choose 3-fold cross-validation as our resampling strategy; this creates three pairs of training/test sets which consist of the *outer resampling loop*. For *each* pair, we perform tuning with a new resampling strategy (say, 4-fold cross-validation), use the tuned parameters on the training set of that pair to fit a model and evaluate the model's performance on the test set. This gives one set of hyperparameters for each of the 3 pairs in the outer resampling.
+
+The mlr package offers a way to do this nested resampling without actually programming any loops:
+
+1) Generate a wrapped learner using `makeTuneWrapper` or `makeFeatSelWrapper` and specify the **inner** resampling strategy using the `resampling` argument.
+
+2) Call function `resample` and pass the **outer** resampling startegy to its `resampling` argument.
+
+Different inner and outer resampling strategies can be used. It is common to have the prediction and performance evaluation on a fixed outer set hence the outer strategy can be set using `makeFixedHoldoutInstance` to generate the outer resampling. For the inner resampling strategy, using `ResampleDesc` is preferable to `ResampleInstance`. The default setting is for the inner resampling strategy to be instantiated just once so tuning/feature selection are compared to the same inner training/test sets. However, if needed, this can be turned off by setting `same.resampling.instance = FALSE` in the `make` tuning/feature selection functions.
+
+Parallelizing nested resampling is usually a good idea as it can be computationally expensive. However, for the purposes of this tutorial and to keep things fast, we keep the iterations in the loops, low.
+
+#### Tuning
+
+We carry out nested resampling with tuning first. The objective is to train a learner using the `ksvm` learner class on a classification task (yes, the `iris` data of course!) and tune the hyperparameters `C` and `sigma`. To set this up, we need a search space and a search strategy, as before (see earlier section on *tuning*). 
+
+```{r}
+ps <- makeParamSet(
+  makeDiscreteParam("C", values = 2^(-2:2)),
+  makeDiscreteParam("sigma", values = 2^(-2:2))
+)
+ctrl <- makeTuneControlGrid() #using defaults
+```
+
+We choose *subsampling* as the inner strategy with 2 iterations (and the default split date of 2/3). In subsampling, the size of the training and test sets is independent of the number of folds (vs *k*-fold CV) but since the split is random, some obervations may never be selected and others may be selected many times. Further, the resampling here is done without replacement so each subsample of size *b* is a sample from the true, unknown distribution of the original sample. This is in contrast with bootstrap resampling where each sample (this is with replacement) has the same size as the original sample but is now from the empirical distribution associated with the original sample.
+
+
+```{r}
+inner <- makeResampleDesc("Subsample", iters = 2)
+lrn <- makeTuneWrapper("classif.ksvm", resampling = inner, par.set = ps, control = ctrl, show.info = FALSE)
+```
+
+For the outer resampling loop, we choose 3-fold cross-validation.
+
+```{r}
+outer <- makeResampleDesc("CV", iters = 3)
+r <- resample(lrn, iris.task, resampling = outer, extract = getTuneResult, show.info = FALSE)
+r
+#error rates on outer tests
+r$measures.test
+```
+
+Recall that if we want access to the train error rates as well, we need to set `predict = "both"` in the *outer* resampling strategy.
+
+In `resample` we can use the function `extract` to extract infromation from a fitted model during resampling. Keeping the entire model may be too expensive but this can be set using `models = TRUE`. The function `getTuneResult` allows us to access the optimal set of hyperparameters in each iteration in the `outer` loop. When calling `r$extract` we obtain the optimal hyperparameter values as well as the aggregated performance value from the *inner* iterations (here, we asked for 2 iters). This is in contrast with `r$measures.test`. 
+
+```{r}
+r$extract
+```
+
+It is possible to compare the performance measures for each pair of settings for `C` and `sigma` tried in each iteration in the outer resampling. 
+
+```{r}
+opt.paths <- getNestedTuneResultsOptPathDf(r) #returns df
+head(opt.paths, 10)
+```
+
+The optimal configuration depends on the data but from this experiment, one can identify a good range of hyperparameters that give good performance. Instead of going through the results in a table one by one, it is easier to visualize the results using a tile plot representing the search grid colored by the `mmce.test.mean`.
+
+```{r}
+g <- ggplot(opt.paths, aes(x = C, y = sigma, fill = mmce.test.mean)) + geom_tile() + facet_wrap( ~ iter)
+g
+```
+
+Lastly, if we want to access just the optimal hyperparameter values for each iteration, we can use the `resample` object with `getNestedTuneResultsX`.
+
+```{r}
+getNestedTuneResultsX(r)
+```
+
+#### Feature selection
+
+Nested resampling with feature selection wrapper works very similary to the tuning example in the previous subsection. We create a learner with the feature selection wrapper and pass an inner resampling strategy. For each iteration in the resampling strategy made up of training/test sets, feature selection according to the strategy chosen is carried out. Then, each training in the outer resampling is trained with its selected features and the performance is evaluated on the correspoding test set. 
+
+```{r}
+inner <- makeResampleDesc("CV", iters = 3)
+lrn <- makeFeatSelWrapper("regr.lm", resampling = inner, control = makeFeatSelControlSequential(method = "sfs"), show.info = FALSE)
+
+outer <- makeResampleDesc("Subsample", iters = 2)
+r <- resample(lrn, bh.task, resampling = outer, extract = getFeatSelResult, show.info = FALSE)
+r
+r$measures.test
+```
+
+Again, we can access the information we asked to be extracted using `r$extract`. We then access the features selected in the two iterations in the outer resampling. 
+
+```{r}
+r$extract
+r$extract[[1]]$x
+r$extract[[1]]$y
+```
+
+The optimization path for each iteration in the outer loop can be read using the function `analyzeFeatSelResult` which can be applied to `r$extract` in a loop.
+
+```{r}
+opt.paths <- lapply(r$extract, function(x) analyzeFeatSelResult(x))
+opt.paths
+```
+
+#### Filter methods with tuning
+
+As seen previously, filter methods assign an importance value to each feature; upon setting a threshold value or a fixed number/percentage ranking the most important features, a subset of variables may be selected for training a learner. The threshold or fixed number/percentage of features to keep usually needs to be tuned. To do this, we need to make a `Filter` wrapper where we choose a filtering method -  we tune the parameter associated with the subset selection in a `Tune` wrapper. So we wrap a base learner (here, we fuse linear regression on the `bh.task`) twice.
+
+```{r}
+lrn <- makeFilterWrapper(learner = "regr.lm", fw.method = "chi.squared")
+ps <- makeParamSet(
+  makeDiscreteParam("fw.threshold", values = seq(0, 1, 0.2))
+)
+ctrl <- makeTuneControlGrid()
+inner <- makeResampleDesc("CV", iters = 3)
+lrn <- makeTuneWrapper(learner  = lrn, resampling = inner, par.set = ps, 
+                       control = ctrl, show.info = FALSE)
+```
+
+The subset selection parameter is tuned in the inner resampling loop using data from each iteration in the outer resampling. The chosen parameter is used to train a learner using each of the training set in the outer resampling. The outer resampling strategy here is chosen as 3-fold cross-validation.
+
+```{r}
+outer <- makeResampleDesc("CV", iters = 3)
+r <- resample(learner = lrn, task = bh.task, resampling = outer, models = TRUE, show.info = FALSE)
+r
+```
+
+The regression task `bh.task` has 506 observations and 13 features. In the example above we kept the models in `resample` and so we can access information about them contained in the object returned by `resample`. 
+
+```{r}
+r$models
+```
+
+Note that `r$models` gives us information on the number of observations used to train the learner and what hyperparameters were explored. The number of features indicated is the number included in the task, it does not represent the size of the subset of features selected. Feature selection information can be extracted using the function `getFilteredFeatures`.
+
+```{r}
+lapply(r$models, getFilteredFeatures) #all features?
+lapply(r$models, function(x) getFilteredFeatures(x$learner.model$next.model))
+```
+
+[Ok, so calling `getFilteredFeatures` on `r$models` returns all available features, I suppose that has to do something with the double wrapper but couldn't find info on `next.model` anywhere. When we just used the `FilterWrapper` learner in the previous section, `getFilteredFeatures(r$models)` returned the *selected* features. Since we often do not want to keep the models since it can get expensive, we can use `extract = function(x) getFilteredFeatures(x$learner.model$next.model)` in `resample` to get the filtered features in this case].
+
+We can access the tune results from the full model using the function `getTuneResult`. Of course note that if the models are not kept, then we can still access information on the tuning and, from that, information on the optimization path by setting `extract = getTuneResult` in `resample`. 
+
+```{r}
+res <- lapply(r$models, getTuneResult)
+res
+```
+
+From `res`, we can then obtain information on the optimization paths.
+
+```{r}
+opt.paths <- lapply(res, function(x) as.data.frame(x$opt.path))
+opt.paths
+```
+
+
+#### Benchmark experiments
+
+We now extend the techniques used in nested resampling above to benchmark experiments where we compare different learners on one or more tasks. Tuning or feature selection occurs using different inner resampling descriptions and then benchmark is called with outer resampling for all tasks.
+ 
+**Example 1: Two tasks, two learners, tuning**
+
+In this first example, we use the `iris` and `sonar` task data with two learners (`ksvm` and `kknn`). We perform tuning on both of them.
+
+```{r}
+tasks <- list(iris.task, sonar.task)
+
+# svm tune wrapper in inner resampling loop
+ps <- makeParamSet(
+  makeDiscreteParam("C", 2^(-1:1)),
+  makeDiscreteParam("sigma", 2^(-1:1))
+)
+ctrl <- makeTuneControlGrid()
+inner <- makeResampleDesc("Holdout")
+lrn1 <- makeTuneWrapper("classif.ksvm", resampling = inner, par.set = ps, control = ctrl, show.info = FALSE)
+
+# knn tune wrapper in inner resampling loop
+ps <- makeParamSet(makeDiscreteParam("k", 3:5))
+ctrl <- makeTuneControlGrid()
+inner <- makeResampleDesc("Subsample", iters = 3)
+lrn2 <- makeTuneWrapper("classif.knn", resampling = inner, control = ctrl, par.set = ps, show.info = FALSE )
+
+lrns <- list(lrn1, lrn2)
+
+# outer resampling loop
+outer <- list(makeResampleDesc("Holdout"), makeResampleDesc("Bootstrap", iters = 2))
+res <- benchmark(lrns, tasks, outer, measures = list(acc, ber), show.info = FALSE)
+# aggregated performances from the outer resampling loop
+res
+```
+
+The `resamplings` argument in `benchmark` gives resampling strategies for *each* task. If only one is applied, it is replicated to match the number of tasks, if none are applied, the default 10-fold corss-validation is used. So, in the above example, the outer resampling for the `iris` task is set to *holdout* and for the `sonar` task is set to *bootstrap* with 2 iterations. 
+
+We can access the benchmark result using the `get` functions available in the mlr package. We can access the outer resampling individual performances using `getBMRPerformances`. 
+
+```{r}
+getBMRPerformances(res, as.df = TRUE)
+```
+
+This gives the result of each iteration specified in the outer resampling strategy for each task, trained on each learner. Since for the `iris` task we use *holdout*, the performance is tested on a single test set for each learner. With the `sonar` task, we have *bootstrap* with 2 iterations, we get 2 test sets for each learner. 
+
+To obtain the results of the tuning, we use `getBMRTuneResults` on the object returned by `benchmark`.
+
+```{r}
+getBMRTuneResults(res, as.df = TRUE)
+```
+
+The `task.ids` and `learner.ids` arguments can be used in `getBMRTuneResults` to access the tuning results from individual learners and tasks. We can access the tuned hyperparameter settings from a nested tuning using `getNestedTuneResultsX`; this takes as an argument a `ResampleResult` so in the case of the `benchmark` object, we need to input the element from the list of results contained in the benchmark object `res$results`.
+
+```{r}
+# tuned hyperparameters
+getNestedTuneResultsX(res$results[["Sonar-example"]][["classif.ksvm.tuned"]])
+# get the opt.paths from each tuning step from the outer resampling
+getNestedTuneResultsOptPathDf(res$results[["Sonar-example"]][["classif.ksvm.tuned"]])
+```
+
+**Example 2: One task, two learners, feature selection**
+
+In this example, we wrap a linear regression learner with feature selection wrapper achieved by a sequential forward search. The features are selected using a two-iteration, subsample strategy (inner resampling). The second learner is a base `rpart` regression algorithm (no feature selection).
+
+```{r}
+ctrl <- makeFeatSelControlSequential(method = "sfs")
+inner <- makeResampleDesc("Subsample", iters = 2)
+lrn <- makeFeatSelWrapper("regr.lm", resampling = inner, control = ctrl, show.info = FALSE)
+
+lrns <- list(makeLearner("regr.rpart"), lrn)
+
+outer <- makeResampleDesc("Subsample", iters = 2)
+res <- benchmark(learners = lrns, tasks = bh.task, resamplings = outer, show.info = FALSE)
+res
+```
+
+The selected features can be accessed using `getBMRFeatSelResults`:
+
+```{r}
+getBMRFeatSelResults(res)
+```
+
+Again, we can access specific learners:
+
+```{r}
+feats <- getBMRFeatSelResults(res, learner.ids = "regr.lm.featsel")
+feats <- feats[["BostonHousing-example"]][["regr.lm.featsel"]]
+```
+
+The list `feats` now has information on the outer resampling iterations where for each element in the list, `$x` and `$y` access the features and resampled performance of the test set.
+
+```{r}
+feats[[1]]$x
+feats[[1]]$y
+```
+
+The optimization paths indicating which features were selected during the feature selection search along with the corresponding test performances can be extracted using `$opt.path`. 
+
+```{r}
+opt.paths <- lapply(feats, function(x) as.data.frame(x$opt.path))
+head(opt.paths[[1]])
+```
+
+The function `analyzeFeatSelResult` gives a clearer overview of what feature has been added in sequence with the improvement in performance. 
+
+```{r}
+analyzeFeatSelResult(feats[[1]])
+```
+
+
+**Example 3: One task, two learners, feature filtering with tuning**
+
+This is an example where we use feature filtering and tune a parameter in the filtering method. 
+
+```{r}
+# feature filtering with tuning in inner loop
+lrn <- makeFilterWrapper(learner = "regr.lm", fw.method = "chi.squared")
+ps <- makeParamSet(makeDiscreteParam("fw.abs", values = seq_len(getTaskNFeats(bh.task))) )
+ctrl <- makeTuneControlGrid()
+inner <- makeResampleDesc("CV", iters = 2)
+lrn <- makeTuneWrapper(lrn, resampling = inner, par.set = ps, control = ctrl, show.info = FALSE)
+
+# outer loop
+lrns <- list(makeLearner("regr.rpart"), lrn)
+outer <- makeResampleDesc("Subsample", iters = 3)
+res <- benchmark(lrns, tasks = bh.task, resamplings = outer, show.info = FALSE)
+res
+```
 
 
