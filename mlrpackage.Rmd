@@ -1260,7 +1260,7 @@ lapply(r$models, getFeatSelResult)
 ```
 
 
-### Nested Resampling
+### Nested resampling
 
 When we introduced *tuning*, we carry out the optimization over the same data. As a result, the estimated performance could be optimistically biased. To obtain an unbiased performance estimatation, we use **nested resampling**. In nested resampling, data preprocessing and feature selection is included in each training/test data resulting in an honest performance estimate. As an example consider a case where we want to train a learner with hyperparameter tuning. Suppose we choose 3-fold cross-validation as our resampling strategy; this creates three pairs of training/test sets which consist of the *outer resampling loop*. For *each* pair, we perform tuning with a new resampling strategy (say, 4-fold cross-validation), use the tuned parameters on the training set of that pair to fit a model and evaluate the model's performance on the test set. This gives one set of hyperparameters for each of the 3 pairs in the outer resampling.
 
@@ -1541,6 +1541,1115 @@ lrns <- list(makeLearner("regr.rpart"), lrn)
 outer <- makeResampleDesc("Subsample", iters = 3)
 res <- benchmark(lrns, tasks = bh.task, resamplings = outer, show.info = FALSE)
 res
+```
+
+### Cost-sensitive classification
+
+Classifiers are biased to predict well the *majority* class. In regular classification problems, all misclassification errors are taken to be equal. If we take the example of a medical test used to identify patients with tumor (positive class) and patients without tumor (negative class), there should be a higher cost associated with a *false negative* (FN) than a *false positive* (FP). In the former case, we miss the tumor and the patient potentially dies as a result of not undergoing treatment while in the latter case, the patient is, in addition of giving him/her quite a scare, sent to carry out additional tests. The FN error therefore should be associated a higher cost than the FP error. 
+
+The confusion matrix for a binary classification problem with classes `+` and `-` is given below:
+
+Actual/Predicted | +    |    -
+--------------- | ------|------
++               |  TP   |   FN
+-               |  FP   |   TN
+
+where the usual metrics are:
+
+where the usual metrics are:
+
+sensitivity/recall = $\frac{TP}{TP+FN}$, specificity = $\frac{TN}{FP+TN}$, and precision = $\frac{TP}{TP+FP}$. 
+
+When calculating *classification costs*, we associate a cost with misclassification, i.e. $C(i | j)$ is the cost of misclassifying class $j$ as class $i$. As indicated above, in the medical example, a FN is associated with higher cost than a FP:
+
+$C(-|+) > C(+|-)$.
+
+The associated cost matrix therefore is given as:
+
+
+Actual/Predicted | +    |    -
+--------------- | ------|------
++               |  $C(+|+)$   |   $C(-|+)$
+-               |  $C(+|-)$   |   $C(-|-)$
+
+The cost matrix can then be used for cost-sensitive evaluation of classifiers and cost-sensitive classification where the objective is to minimize expected costs. The cost associated with predicting the correct class is of course lowest; usually the diagonal is calculated to be zero or the matrix is rescaled such as the diagonal is made up of zeros. Some algorithms can utilize a cost matrix directly; an example is `rpart`. Alternatively, we can use the cost matrix to calculate a threshold when predicting class labels or carry out rebalancing wherein less costly classes are given higher importance in training. The rebalancing is achieved either through *weights* (if the learner supports them) or through *oversampling/undersampling* We start with examples in **binary classification** and then we move to **multi-class**. 
+
+#### Binary classification examples
+
+In mlr, we use the ordinary `ClassifTask` for classification as in previous parts of this tutorial. The `CostSensTask` is used when the costs are *example-dependent*; in our case the costs are *class-dependent*. In the example below, we use the `GermanCredit` data to create a classification task and then remove constant features using the appropriate function.
+
+```{r}
+data(GermanCredit, package = "caret")
+credit.task <- makeClassifTask(data = GermanCredit, target = "Class")
+credit.task <- removeConstantFeatures(credit.task)
+credit.task
+```
+
+By default, bad is the positive class, as indicated when printing `credit.task`. We then create the cost matrix (note that this needs to be calculated based on application).
+
+```{r}
+costs <- matrix(c(0,1,5,0), 2)
+colnames(costs) <- rownames(costs) <- getTaskClassLevels(credit.task)
+```
+
+We first create a logistic regression learner to fit the data and predict posterior probabilities. The classes are then predicted from those probabilities with a default threshold of 0.5. Note that `multinom` fits multinomial log-linear models via neural networks.
+
+```{r}
+lrn <- makeLearner("classif.multinom", predict.type = "prob", trace = FALSE)
+mod <- mlr::train(lrn, credit.task)
+pred <- predict(mod, task = credit.task)
+pred
+```
+
+According to the cost matrix, we should predict class `Good` only if we are very sure that the class label is in fact `Good`. We need to increase the threshold for class `Good` and decrease the threshold for class `Bad`. 
+
+**Theoretical thresholding**
+
+The cost matrix can be used to calculate a theoretical thresholding for the *positive class* [Elkan (2001)](http://web.cs.iastate.edu/~honavar/elkan.pdf), as follows:
+
+$t^* = \frac{C(+|-)-C(-|-)}{C(+|-)-C(+|+)+C(-|+)-C(-|-)}$
+
+With the diagonal being zeros, the formula simplifies quite a bit.
+
+```{r}
+th <- costs[2,1]/(costs[2,1]+costs[1,2])
+th
+```
+
+We can change the threshold before training in `makeLearner` using the argument `predict.threshold = th` where `th` is the desired threshold or, after predidction by calling `setThreshold` on the object returned by `predict`.
+
+```{r}
+pred.th <- setThreshold(pred, th)
+pred.th
+```
+
+Next, we wish to calculate the cost associated with our predictions averaged over the entire data set. Recall that the objective is to choose a model which minimize the costs. To calculate the averaged costs, we need to create a new performance measure using `makeCostMeasure`. 
+
+```{r}
+credit.costs <- makeCostMeasure(id = "credit.costs", name = "Credit costs", costs = costs, task = credit.task, best = 0, worst = 5)
+credit.costs
+```
+
+We now calculate the performance based on our new `credit.costs` measire and the misclassification error rate on both prediction objects `pred` and `pred.th`:
+
+```{r}
+performance(pred, measures = list(credit.costs, mmce))
+performance(pred.th, measures = list(credit.costs, mmce))
+```
+
+No resampling was carried out and therefore the same data (all of it) was used for training and prediction leading to potentially overly optimistic performance values. Below, we fit again a logistic regression model using 3-fold cross-validation to obtain less biased predictions. Note that we create a `ResampleInstance` to specify training/test sets so that we get comparable performance values when we try different cost-sensitive methods on the `credit.task` data.
+
+```{r}
+rin <- makeResampleInstance("CV", iters = 3, task = credit.task)
+lrn <- makeLearner("classif.multinom", predict.type = "prob", predict.threshold = th, trace = FALSE)
+r <- resample(lrn, credit.task, rin, measures = list(credit.costs, mmce), show.info = FALSE)
+r
+```
+
+To get the cross-validated performance measures using the default threshold, we use the `performance` function as above:
+
+```{r}
+pred.th <- setThreshold(r$pred, 0.5)
+performance(pred.th, measures = list(credit.costs, mmce))
+```
+                            
+We can visualize the performance measures (costs, mmce, etc) vs threshold in [0,1] for the positive class using `plotThreshVsPerf` using data from `generateThreshVsPerfData`. The latter requires a prediction object (from `predict`, `resample`, `benchmark`).
+
+```{r}
+d <- generateThreshVsPerfData(r, measures = list(credit.costs, mmce))
+plotThreshVsPerf(d, mark.th = th)
+```
+
+From the plots, we observe that the theoretical threshold (indicated by the vertical line) is a little large.
+
+**Empirical thresholding**
+
+Theoretical thresholding is reliable when the predicted posterior probabilities are correct; empirical thresholding is useful when the probabilities are order-correct. In empirical thresholding, the cost-optimal threshold is selected for a given learner using training data. The function `tuneThreshold` is used to determine the optimal threshold; this is used with a resampling strategy and not on the entire data set, to avoid overfitting. The function `tuneThreshold` returns the optimal threshold and performance for the specified measure (below, we choose to minimize `credit.costs`).
+
+```{r}
+lrn <- makeLearner("classif.multinom", predict.type = "prob", trace = FALSE)
+
+r <- resample(lrn, credit.task, rin, measures = list(credit.costs, mmce), show.info = FALSE)
+r
+
+tune.res <- tuneThreshold(pred = r$pred, measure = credit.costs)
+tune.res
+```
+
+
+**Rebalancing**
+
+To minimize average costs, observations associated with the less costly class should be given higher importance during training. One way of achieving this is through class weighting. The learner must be able to support observation or class weights to use this method. Alternative methods, over- and undersampling, are considered later in this section.
+
+*Weighting*
+
+```{r}
+# check which mlr learners support weights
+listLearners("classif", properties = "weights")[c("class", "package")] #obs weights
+listLearners("classif", properties = "class.weights")[c("class", "package")] #class weights
+```
+
+According to [Elkan 2001](http://web.cs.iastate.edu/~honavar/elkan.pdf), the proportion of observations in the positive class is multiplied by
+
+$\frac{1-t}{t}\frac{t_0}{1-t_0}$,
+
+where $t$ and $t_0$ are the target and original thresholds, respectively. If $t_0=0.5$, the second factor is equal to 1. Alternatively, the proportion of observations in the negative class can be multiplied by the inverse. The *theoretical weights* can be a function of the theoretical threshold if the target threshold equals the theoretical value, $t^*$. 
+
+```{r}
+# theoretical weights for positive class corresponding to theoretical threshold
+w <- (1-th)/th
+w
+```
+
+In binary classification, if we choose to set a weight for the positive class then the negative class receives a weight of 1 automatically. The mlr package offers a `makeWeightedClassWrapper` which allows to assign class weights to a learner using the argument `wcw.weight`. If the learner supports observation weights then these are internally generated during training or resampling. For available class weight support, the weights are simply passed on to the appropriate learner parameter.
+
+```{r}
+lrn <- makeLearner("classif.multinom", trace = FALSE)
+lrn <- makeWeightedClassesWrapper(lrn, wcw.weight = w)
+lrn
+```
+
+We use the resampling instance created above (`rin`) so that we can compare the performance of *rebalancing* against *thresholding*.
+
+```{r}
+r <- resample(lrn, credit.task, rin, measures = list(credit.costs, mmce), show.info = FALSE)
+r
+```
+
+Now, the `classif.multinom` learner supports observation weights. If we were to choose a learner that supports class weights like, for instance, `classif.ksvm`, we can pass them directly or using the `makeWeightedClassesWrapper`:
+
+```{r}
+# directly
+lrn <- makeLearner("classif.ksvm", class.weights = c(Bad = w, Good = 1))
+# using wrapper
+lrn <- makeWeightedClassesWrapper("classif.ksvm", wcw.weight = w)
+
+r <- resample(lrn, credit.task, rin, measures = list(credit.costs, mmce), show.info = FALSE)
+r
+```
+
+Just like with the theoretical threshold, the theoretical weights may not always be suitable. We can tune the `wcw.weight` parameter like any other parameter using `tuneParams`. Using the threshold weight however can help us narrow down the search.
+
+```{r}
+lrn <- makeLearner("classif.multinom", trace = FALSE)
+lrn <- makeWeightedClassesWrapper(lrn)
+ps <- makeParamSet(makeDiscreteParam("wcw.weight", values = seq(4, 12, 0.5) ))
+
+ctrl <- makeTuneControlGrid()
+
+tune.res <- tuneParams(lrn, credit.task, rin, measures = list(credit.costs, mmce), ps, ctrl, show.info = FALSE)
+
+as.data.frame(tune.res$opt.path)[1:3]
+```
+
+**Over- and undersampling**
+
+Not all learners support observations or class weights and so in those cases we *change* the training data by over- or undersampling. With the theoretical weighting, we calculated that the positive class in the German credit data should receive a weight of 5 (or, equivalently, the negative class should receive a weight of 1/5). This can be achieved by the function `oversample` (`undersample`) giving it a `rate` of 5 (1/5).
+
+```{r}
+credit.task.over <- oversample(credit.task, rate = 5, cl = "Bad")
+lrn <- makeLearner("classif.multinom", trace = FALSE)
+mod <- train(lrn, credit.task.over)
+```
+
+We trained our learner on the changed data in `credit.task.over` but our predictions and the calculated traiining performance needs to be assessed using the original data in `credit.task`. 
+
+```{r}
+pred <- predict(mod, task = credit.task)
+performance(pred, measures = list(credit.costs, mmce))
+```
+
+Of course the usual strategy for more accurate performance measures is resampled performances but calling `resample` with `credit.task.over` does not work since predictions need to be based on the original data. To overcome this issue, we create a wrapped learner with `makeOversampleWrapper`.
+
+```{r}
+lrn <- makeLearner("classif.multinom", trace = FALSE)
+lrn <- makeOversampleWrapper(lrn, osw.rate = w, osw.cl = "Bad")
+lrn
+
+r <- resample(lrn, credit.task, rin, measures = list(credit.costs, mmce), show.info = FALSE)
+r
+```
+
+We might want to tune the `rate` parameter to minimize the costs. To do so we create a wrapped learner as above and tune `osw.rate` using `tuneParams`.
+
+```{r}
+lrn <- makeLearner("classif.multinom", trace = FALSE)
+lrn <- makeOversampleWrapper(lrn, osw.cl = "Bad")
+ps <- makeParamSet(makeDiscreteParam("osw.rate", seq(3, 7 , 0.25)))
+ctrl <- makeTuneControlGrid()
+tune.res <- tuneParams(lrn, credit.task, rin, measures = list(credit.costs, mmce), control = ctrl, show.info = FALSE, par.set = ps)
+tune.res
+```
+
+#### Multi-class examples
+
+It is possible to calculate thresholds and rebalancing weights in a manner similar to that of the binary case if the cost matrix has a special strcuture where $C(k|l)=C(l)$ for $k=1,...,K$ and $k \neq l$. In $C(k|l)$, $k$ is the *predicted class* and $l$ is the *true label*. The above structure implies that the cost of misclassifying an observation is independent of the predicted class label. For our multi-class examples below, we use threshold and rebalancing using the `waveform` data and an associated cost matrix that does *not* conform to the special structure. 
+
+**Theoretical thresholding**
+
+```{r}
+df <- mlbench::mlbench.waveform(500)
+wf.task <- makeClassifTask(id = "waveform", data = as.data.frame(df), target = "classes")
+
+costs <- matrix(c(0, 5, 10, 30, 0 ,8, 80, 4, 0), 3)
+colnames(costs) <- rownames(costs) <- getTaskClassLevels(wf.task)
+
+wf.costs <- makeCostMeasure(id = "wf.costs", name = "waveform costs", costs = costs, task = wf.task, best = 0, worst = 10) # why 10?
+```
+
+Here, we calculate a vector of threshold values as long as the number of classes $K$. The threshold vector is calculated as:
+
+threshold = $\frac{1}{(\text{average costs of true classes})}$
+
+The threshold value is chosen to have the artificial structure mentioned previously, i.e. $C(k,l) = C(l)$ for any $k \neq l$ and we choose $C(l)$ to be the average of the true classes. For example, for class 1, the average would be 110/2 = 55 and hence the threshold value is 1/55. 
+
+Once we have the threshold vector, we divide the predicted probabilities by the threshold vector to obtain adjusted probabilities. The class with the highest adjusted probability is predicted. We set the threshold using `setThreshold`, as before.
+
+```{r}
+lrn <- makeLearner("classif.rpart", predict.type = "prob")
+rin <- makeResampleInstance("CV", iters = 3, task = wf.task)
+r <- resample(lrn, wf.task, rin, measures = list(wf.costs, mmce), show.info = FALSE)
+r
+
+avg <- rowSums(costs)/2
+th <- 1/avg
+# important: the threshold vector needs to have names which correspond to the class labels
+names(th) = getTaskClassLevels(wf.task)
+th
+
+pred.th <- setThreshold(r$pred, threshold = th)
+performance(pred.th, measures = list(wf.costs, mmce))
+```
+
+It seems that the data on class probabilities found in `pred.th$data` and `r$pred$data` show the original predicted probabilities but it appears that in `pred.th` the class label is predicted using the adjusted probabilities so all is good. 
+
+**Empirical thresholding**
+
+Once again, we can tune the threshold using `tuneThreshold`. The function returns values that lie in [0,1] and sum up to 1 (the scaling does not change the predicted class labels). 
+
+```{r}
+tune.res <- tuneThreshold(pred = r$pred, measure = wf.costs)
+tune.res
+
+# compare with the standaridized theoretical vector
+th/sum(th)
+```
+
+
+**Rebalancing: weighting**
+
+With weights, the function `makeWeightedClassesWrapper` is used just like in the binary case but for multi-class, we also need to specify the length of the vector corresponding to the number of classes. The weight vector can be tuned using `tuneParams`. 
+
+```{r}
+lrn <- makeLearner("classif.multinom", trace = FALSE)
+lrn <- makeWeightedClassesWrapper(lrn)
+
+ps <- makeParamSet(makeNumericVectorParam("wcw.weight", len = 3, lower = 0, upper = 1))
+ctrl <- makeTuneControlRandom()
+
+tune.res <- tuneParams(lrn, wf.task, resampling = rin, par.set = ps, measures = list(wf.costs, mmce), control = ctrl, show.info = FALSE)
+tune.res
+```
+
+
+Note that `oversample` and `undersample` are for *binary* classification only.
+
+### Imbalanced classification problems
+
+In imbalanced classification problems, the smaller classes tend to be ignored as noise in classifiers thus failing to predict them when given new data. The mlr package offers various correction methods to tackle this problem. The methods are divided into sampling and cost-based approaches. 
+
+#### Sampling-based approaches
+
+The idea is to adjust the proportion of the classes to increase the weight of the minority class observations within the model. 
+
+1. **Undersampling** : randomly chosen cases of the majority class are eliminated while all of the minority class cases are kept.
+
+2. **Oversampling** : additional cases (copies, artifical observations) of the minority class are generated to increase their effect on the classifier while all majority class cases are kept.
+
+3. **Hybrid** : mixture of over- and undersampling strategies.
+
+The above methods directly access the data which means that the sampling is done as part of the *preprocessing* and may be used with every appropriate classifier. Note that the mlr package supports the first 2 approaches currently. 
+
+**Simple over- and undersampling**
+
+In *undersampling*, the majority class is effected while in *oversampling*, copies of the minority class are generated. In oversampling, the minority cases are considered at least once when fitting the model while exact copies are generated by random sampling with repetitions.
+
+We first look at some simulated data for a binary problem with classes `A` and `B`. 
+
+```{r}
+data.imbal.train <- rbind(
+  data.frame(x = rnorm(100, mean = 1), class = "A"),
+  data.frame(x = rnorm(5000, mean = 2 ), class = "B")
+)
+
+task <- makeClassifTask(data = data.imbal.train, target = "class")
+task.over <- oversample(task, rate = 8)
+task.under <- undersample(task, rate = 1/8)
+
+table(getTaskTargets(task))
+table(getTaskTargets(task.under))
+table(getTaskTargets(task.over))
+```
+
+In `undersample` the rate is in [0,1]; here, `rate = 1/8` implies that the number of majority class observations are reduced to 1/8th of their original size. In `oversample`, rate $\geq$ 1; here, `rate = 8` means the minority class observations have been increased to 8 times of their original size. We compare the performance on each task.
+
+```{r}
+lrn <- makeLearner("classif.rpart", predict.type = "prob")
+mod <- train(lrn, task)
+mod.over <- train(lrn, task.over)
+mod.under <- train(lrn, task.under)
+data.imbal.test <- rbind(
+  data.frame(x = rnorm(10, mean = 1), class = "A"),
+  data.frame(x = rnorm(500, mean = 2 ), class = "B")
+)
+
+performance(predict(mod, newdata = data.imbal.test), measures = list(mmce, ber, auc))
+
+performance(predict(mod.over, newdata = data.imbal.test), measures = list(mmce, ber, auc))
+
+performance(predict(mod.under, newdata = data.imbal.test), measures = list(mmce, ber, auc))
+```
+
+Note that since `mmce` evaluates the overall accuracy of the predictions, the balanced error rate (`ber`) which gives the average of the errors in each class and the area under the ROC curver (`auc`) may be more suitable performance measures.
+
+```{r}
+getConfMatrix(predict(mod, newdata = data.imbal.test))
+getConfMatrix(predict(mod.under, newdata = data.imbal.test))
+getConfMatrix(predict(mod.over, newdata = data.imbal.test))
+```
+
+**Over- and undersampling wrappers**
+
+The over- and undersampling may be dont via the use of wrapped learners as well thus keeping the task unmodified.
+
+```{r}
+lrn.over <- makeOversampleWrapper(lrn, osw.rate = 8)
+lrn.under <- makeUndersampleWrapper(lrn, usw.rate = 1/8)
+mod <- train(lrn, task)
+mod.over <- train(lrn.over, task)
+mod.under <- train(lrn.under, task)
+
+
+performance(predict(mod, newdata = data.imbal.test), measures = list(mmce, ber, auc))
+
+performance(predict(mod.over, newdata = data.imbal.test), measures = list(mmce, ber, auc))
+
+performance(predict(mod.under, newdata = data.imbal.test), measures = list(mmce, ber, auc))
+```
+
+**Extensions to oversampling**
+
+1. SMOTE (Synthetic Minority Oversampling Technique)
+
+As mentioned previously, in oversampling, copies of minority class observations are created; however, this may lead to overfitting. *SMOTE* constructs the "new" cases by randomly choosing an observation and interpolating it with randomly chosen next neighbors (this number can be set in the function) such that an artificial "new" observation is created. Both numeric and factor features are handled within *SMOTE*. Again, we can either modify the task or use a wrapped learner.
+
+```{r}
+#  modify a task
+task.smote <- smote(task, rate = 8, nn = 5)
+table(getTaskTargets(task))
+
+# wrap a learner
+lrn.smote <- makeSMOTEWrapper(lrn, sw.rate = 8, sw.nn = 5 )
+mod.smote <- train(lrn.smote, task)
+performance(predict(mod.smote, newdata = data.imbal.test), measures = list(mmce, ber, auc))
+```
+
+2. Overbagging
+
+A second approach is supported in the mlr package for oversampling which is combined with bagging. For each bagging iteration, minority classes are oversampled using `obw.rate`. The majority class cases are either all taken into account with `obw.maxcl = "all"` or bootstrapped with replacement to increase variability between training data sets during iterations using `obw.maxcl = "boot"`. 
+
+To create the wrapped learner for bagging + oversampling wrapped learner, we use the function `makeOverBaggingWrapper` in a similar way as the `makeBaggingWrapper`. The number of iters or fitted models is set through the argument `iters`.
+
+```{r}
+# first make the base learner
+lrn <- makeLearner("classif.rpart", predict.type = "response") # needs to be response for wrapper
+obw.lrn <- makeOverBaggingWrapper(lrn, obw.rate = 8, obw.iters = 3)
+```
+
+Prediction works as follows: for classification, we do majority voting to create a discrete label and probabilities are predicted by considering the proportions of all predicted labels. The benefits of overbagging are strongly dependent on the learner specified. For instance, overbagging with the *random forest* as the learning algorithm may be of little use since the learner is already a strong, bagged learner. This is shown in the next example. We train on a wrapped decision tree (`rpart`) and a random forest learner with overbagging and compare the performance. 
+
+```{r}
+lrn <- setPredictType(lrn, "prob")
+set.seed(34)
+rin <- makeResampleInstance("CV", iters = 5, task = task)
+r1 <- resample(learner = lrn, task = task, resampling = rin, show.info = FALSE, measures = list(mmce, ber, auc))
+r1$aggr
+
+obw.lrn <- setPredictType(obw.lrn, predict.type = "prob")
+r2 <- resample(learner = obw.lrn, task = task, resampling = rin, show.info = FALSE, measures = list(mmce, ber, auc))
+r2$aggr
+```
+
+Now with *random forest*:
+
+```{r}
+lrn <- makeLearner("classif.randomForest")
+obw.lrn <- makeOverBaggingWrapper(lrn, obw.rate = 8, obw.iters = 3)
+
+lrn <- setPredictType(lrn, "prob")
+r1 <- resample(learner = lrn, task = task, resampling = rin, show.info = FALSE, measures = list(mmce, ber, auc))
+r1$aggr
+
+# does this bagging step improve performance?
+obw.lrn <- setPredictType(obw.lrn, predict.type = "prob")
+r2 <- resample(learner = obw.lrn, task = task, resampling = rin, measures = list(mmce, ber, auc), show.info = FALSE)
+r2$aggr
+```
+
+
+#### Cost-based approaches
+
+We saw applications of weighted class wrappers (through `makeWeightedClassesWrapper`) in the previous section under *cost-sensitive classification*.
+
+### ROC analysis and performance curves
+
+Threshold values control how predicted posterior probabilities are converted into class labels. *Receiver operating characterstic* (ROC) curves plot the true positive rate (TPR) which is equivalent to the sensitivity (or recall) on the vertical axis against the false positive rate (FPR) which is equivalent to 1-specificity (SPC) on the horizontal axis for all possible threshold values. 
+
+TPR = $\frac{TP}{TP+FN}$ and FPR = 1- SPC, where SPC = $\frac{TN}{TN+FP}$
+
+The ROC curves are useful in:
+
+- assessing performance visualization;
+
+- determining an optimal decision threshold for given class prior probabilities and misclassification costs (helps with cost-sensitive classification?);
+
+- identifying regions where one classifier outperforms another;
+
+- obtaining calibrated estimates of the posterior probabilities.
+
+For more information: [Fawcett (2004)](http://binf.gmu.edu/mmasso/ROC101.pdf), [Fawcett (2006)](https://ccrma.stanford.edu/workshops/mir2009/references/ROCintro.pdf), [Flach (ICML 2004)](http://www.cs.bris.ac.uk/~flach/ICML04tutorial/index.html).
+
+Often, in the absence of background knowledge, there is uncertainty about the class priors or misclassification errors at the time of predictions (difficult to quantify costs, or cost variability with time). A good classifier would therefore be required to work well over a range of decision thresholds; the area under the ROC curve (AUC) gives a scalar measure to compare and select classifiers. We have already used `auc` as a measure in the previous section on *imbalanced classification problems*. The `auc` measure is offered by the `ROCR` package and a generalization to multi-class problems is offered by `pROC` through `multiclass.auc`. The latter builds multiple ROC curves to compute the multi-class AUC. 
+
+The following methods are available in the `mlr` package for plotting ROC curves and other performance curves:
+
+1. `plotROCCurves`: using the result of `generateThreshVsPerfData`, choose any two measures to plot the performance curve.
+
+2. Use the function `asROCRPrediction` to generate a `ROCR` prediction object which can then be used with `ROCR`'s `performance` function which, in turn, creates performance objects that are then used with `plot` for visualization.
+
+3. ViperCharts is a web-based platform for visual performance evaluation of classification, prediction, and information retrieval algorithms. Using `plotViperCharts` with a prediction object, mlr provides an interface to ViperCharts.
+
+We show some examples of the three methods available in mlr next. Note that to use the above, we need learners that are capable of predicting probabilities.  
+
+```{r, echo=FALSE}
+# learners that support prob
+listLearners("classif", properties = c("twoclass", "prob"))
+```
+
+#### Using plotROCCurves
+
+As we have already seen, the function `generateThreshVsPerfData` generates data on threshold vs performance for 2-class classification that can be used for plotting. The function takes in an object which is a list of `Prediction`, `ResampleResult` or `BenchmarkResult`. The resulting object can then be used with `plotROCCurves` for plotting using `ggplot2`. 
+
+*Example 1: single predictions*
+
+```{r}
+n <- getTaskSize(sonar.task)
+train.set <- sample(n, size = round(2/3 * n))
+test.set <- setdiff(seq_len(n), train.set)
+
+# linear discriminant analysis learner
+lrn1 <- makeLearner("classif.lda", predict.type = "prob")
+mod1 <- train(lrn1, sonar.task, subset = train.set)
+pred1 <- predict(mod1, task = sonar.task, subset = test.set)
+```
+
+Since the objective is to plot ROC curves, we generate data on FPR and TPR. We also compute the `mmce`.
+
+```{r}
+df <- generateThreshVsPerfData(pred1, measures = list(fpr, tpr, mmce))
+```
+
+We now use `df` with `plotROCCurves` which, by default, plots the first 2 measures passed to `generateThreshVsPerfData` and a dashed diagonal indicating the performance of a random classifier (this can be turned off with `diagonal = FALSE`.
+
+```{r}
+plotROCCurves(df)
+# corresponding auc:
+performance(pred1, auc)
+```
+
+The function `plotROCCurves` plots a pair of performance measures against each other. The individual performance measures against the threshold value may be plotted by calling `plotThreshVsPerf(df)`:
+
+```{r}
+plotThreshVsPerf(df)
+```
+
+We now try a support vector machine with RBF kerner (`ksvm`) on the `sonar.task` and compare the ROC curve between the `lda` and `ksvm` fitted models.
+
+```{r}
+lrn2 <- makeLearner("classif.ksvm", predict.type = "prob")
+mod2 <- train(lrn2, sonar.task, subset = train.set)
+pred2 <- predict(mod2, task = sonar.task, subset = test.set)
+
+# generateThreshVsPerfData generated using a list of predictions to compare performance side-by-side
+
+df <- generateThreshVsPerfData(list(lda = pred1, ksvm = pred2), measures = list(fpr, tpr, mmce))
+plotROCCurves(df)
+performance(pred2, auc)
+```
+
+
+The `df` object contains the element `$data` from which we can generate custom plots like, for example, superimposed ROC curves which clearly depict the AUC.
+
+```{r}
+qplot(x = fpr, y = tpr, data = df$data, color = learner, geom = "path")
+```
+
+With `plotROCCurves` we can plot other performance measures by passing the various measures as arguments in `measures` in `generateThreshVsPerfData`. We then choose the ones to be plotted via the `measures` argument in `plotROCCurves`.
+
+```{r}
+df <- generateThreshVsPerfData(list(lda = pred1, ksvm = pred2), measures = list(tpr, ppv, tnr))
+```
+
+Note that TPR = sensitivity = recall, TNR = specificity. The *positive predictive value* (PPV) is:
+
+PPV = precision = $\frac{TP}{TP+FP}$.
+
+```{r}
+# precision/recall plot
+plotROCCurves(df, measures = list(tpr, ppv), diagonal = FALSE)
+
+# sensitivity/specificity plot
+plotROCCurves(df, measures = list(tnr, tpr), diagonal = FALSE)
+```
+
+
+**Example 2: benchmark experiment**
+
+We can combine some of the steps above using `benchmark` and, in addition, tune some of the parameters in the learners. We use the `sonar.task` again to fit `lda` and `ksvm` learners. The cost of constraint violation (or regularization parameter), `C` is tuned via a tune wrapper. We want a good performance over the whole threshold range so we set out to *maximize* the AUC. 
+
+```{r}
+# tune wrapper for ksvm
+rdesc.inner <- makeResampleDesc("Holdout")
+ms <- list(auc, mmce)
+ps <- makeParamSet(
+  makeDiscreteParam("C", 2^(-1:1))
+)
+ctrl <- makeTuneControlGrid()
+lrn2 <- makeTuneWrapper(lrn2, resampling = rdesc.inner, measures = ms, par.set = ps, control = ctrl, show.info = FALSE)
+```
+
+The becnhmark experiment is conducted with the `lda` learner and the tuned `ksvm` learner with an outer resampling strategy. 
+
+```{r}
+# the benchmark experiment
+lrns <- list(lrn1, lrn2)
+rdesc.outer <- makeResampleDesc("CV", iters = 5)
+
+bmr <- benchmark(lrns, tasks = sonar.task, resamplings = rdesc.outer, measures = ms, show.info = FALSE)
+bmr
+
+# the ROC curves
+df <- generateThreshVsPerfData(bmr, measures = list(fpr, tpr, mmce))
+plotROCCurves(df)
+```
+
+The object returned from `generateThreshVsPerf` calculates aggregated performances according to the resampling strategy. The resulting ROC curves are threshold-averaged. If we want to keep the performances from the individual iterations, we can set `aggregate = FALSE`. 
+
+```{r}
+# performance measure from individual iterations
+df <- generateThreshVsPerfData(bmr, measures = list(fpr, tpr, mmce), aggregate = FALSE)
+plotROCCurves(df)
+plotThreshVsPerf(df)
+```
+
+The 5 test folds may also be merged and draw a single ROC curve instead of averaging them as done above. Averaging methods are preferred as they take into account variability which is needed to compare classifier performance. 
+
+
+```{r}
+preds <- getBMRPredictions(bmr)[[1]]
+
+# merging is achieved by changing the class attribute to Prediction
+preds2 <- lapply(preds, function(x) {class(x) = "Prediction"; return(x)})
+
+df <- generateThreshVsPerfData(preds2, measures = list(fpr, tpr, mmce))
+plotROCCurves(df)
+```
+
+
+#### Using asROCRPrediction
+
+As mentioned before, the mlr package provides an interface with the `ROCR` package to draw performance plots. To create the plots, we need a ROCR prediction object which we use with `ROCR::performance` to calculate one or more performance measures and finally, we use `ROCR::plot` to generate the performance plot. 
+
+**Example 1: single predictions**
+
+We revisit the `lda` learner trained on the `sonar.task`. 
+
+```{r}
+n <- getTaskSize(sonar.task)
+train.set <- sample(n, size = (2/3 * n))
+test.set <- setdiff(seq_len(n), train.set)
+
+lrn1 <- makeLearner("classif.lda", predict.type = "prob")
+mod1 <- train(lrn1, sonar.task, subset = train.set)
+pred1 <- predict(mod1, task = sonar.task, subset = test.set)
+
+# convert pred1 to ROCR prediction
+ROCRpred1 <- asROCRPrediction(pred1)
+# calculate perf measures
+ROCRperf1 <- ROCR::performance(ROCRpred1, "tpr", "fpr")
+# generate plots
+ROCR::plot(ROCRperf1)
+```
+
+The advantages of using the ROCR interface lie in the graphical properties available: we can create an ROC curve which is color-coded according to threshold, print selected threshold values onto the curve, and superimpose the convex hull. The convex hull of a set of points in ROC space is a piecewise linear curve connecting a selection of points such that all other points lie below it. The curve is *convex* because each line segment has a slope that it not steeper than the previous one. The curve is drawn with a black, dashed line in the plot below.
+
+```{r}
+ROCR::plot(ROCRperf1, colorize = TRUE, print.cutoffs.at = seq(0.1, 0.9, 0.2), lwd = 2)
+
+ch <- ROCR::performance(ROCRpred1, "rch")
+ROCR::plot(ch, add = TRUE, lty = 2)
+```
+
+**Example 2: benchmark experiments**
+
+Using the same benchmark experiments conducted above, we show the functionality of performance plots with ROCR. 
+
+```{r}
+preds <- getBMRPredictions(bmr)[[1]]
+ROCRpreds <- lapply(preds, asROCRPrediction)
+ROCRperfs <- lapply(ROCRpreds, function(x) ROCR::performance(x, "tpr", "fpr"))
+```
+
+The resampling strategy used in the benchmark experiments was a 5-fold, cross-validation so we obtain 5 different models for each classifier trained. We now plot the ROC curves for each iteration (dashed), the averaged ROC (solid), as well as standard error bars for selected fpr. Note that horizontal averaging is also possible as well as threshold averaging (see later plot). As seen previously, different plot commands can be used in sequence to add to the same figure by selecting `add = TRUE`. Note that the function `plotCI` used below is used internally to plot the error bars.
+
+```{r}
+# averaged learner 1
+plot(ROCRperfs[[1]], col = "blue", avg = "vertical", spread.estimate = "stderror", show.spread.at = seq(0.1, 0.8, 0.1), plotCI.col = "blue", plotCI.lwd = 2, lwd = 2)
+# individual perf 5-fold learner 1
+plot(ROCRperfs[[1]], col = "blue", lty = 2, lwd = .25, add = TRUE)
+
+# averaged learner 2
+plot(ROCRperfs[[2]], col = "red", avg = "vertical", spread.estimate = "stderror", show.spread.at = seq(0.1, 0.6, 0.1), plotCI.col = "red", plotCI.lwd = 2, lwd = 2, add = TRUE)
+# individual perf 5-fold learner 2
+plot(ROCRperfs[[2]], col = "red", lty = 2, lwd = .25, add = TRUE)
+
+legend("bottomright", legend = getBMRLearnerIds(bmr), lty = 1, lwd = 2, col = c("blue", "red"))
+```
+
+It is possible to plot other performance measures. In the next plot, we generate a precision/recall evaluation plot. Here, we obtain a threshold-averaged curve by setting `avg = "threshold"` in `plot`. Note that the ids for the precision and recall performance measures as defined in ROCR are given as `prec` and `rec`, respectively. 
+
+```{r}
+preds <- getBMRPredictions(bmr)[[1]]
+ROCRpreds <- lapply(preds, asROCRPrediction)
+
+ROCRperfs <- lapply(ROCRpreds, function(x) ROCR::performance(x, "prec", "rec"))
+
+plot(ROCRperfs[[1]], col = "blue", avg = "threshold")
+plot(ROCRperfs[[2]], col = "red", avg = "threshold", add = TRUE)
+legend("bottomleft", legend = getBMRLearnerIds(bmr), lty = 1, col = c("blue", "red"))
+```
+
+It may be of use to plot a single performance measure against the threshold values; this is achieved by calling `ROCR::performance` with only one performance measure (e.g. `acc`). The following plot shows the vertically averaged curve of accuracy vs threshold with the vertical variation around the curve visualized as boxplots.
+
+```{r}
+preds <- getBMRPredictions(bmr)[[1]]
+ROCRpreds <- lapply(preds, asROCRPrediction)
+
+ROCRperfacc <- lapply(ROCRpreds, function(x) ROCR::performance(x, "acc"))
+
+plot(ROCRperfacc[[1]], avg = "vertical", spread.estimate = "boxplot", show.spread.at = seq(.1, .9, .1), ylim = c(0,1), xlab = "threshold", lwd = 2, col = "blue")
+```
+
+
+#### Viper charts
+
+Using `mlr::plotViperCharts` with an object of class `Prediction`, `ResampleResult` or `BenchmarkResult` gererates a url which hosts the ViperCharts curves. The argument `chart` takes a character which represents the first chart to display in focus in browser. All other charts can be displayed by clicking on the browser page menu. The default chart is `rocc`. If `browse = TRUE`, the url opens in the default browser.
+
+```{r}
+z = plotViperCharts(bmr, chart = "rocc", browse = FALSE)
+```
+
+Click [here](`r z`) for the plot.
+
+### Multilabel classification
+
+In multilabel classification, there exist multiple targets that can be assigned to each observation vs just one target in multiclass classification. An example is the following: predict topics that are relevant for a document. For instance, a text might be about any of religion, politics, finance or education at the same time or none of these. Two approaches exist to dealing with multilabel problems:
+
+1. *Problem transformation* : transform the multilabel classification problem to binary or multiclass problems. 
+
+2. *Algorithm adaptation* : adapt multiclass algorithms so that they can be directly applied to the problem.
+
+#### Creating a task
+
+We need to create a task using data in the right format. The data frame needs to consist of the features and a logical vector indicating whether each label is present in the observation or not. Once we have the data in the right format, we can use `makeMultilabelTask`. In what follows, we use the *yeast* data which has 2417 observations, 14 target labels and 103 features. We recreate the multilabel classification `yeast.task` already included in mlr by extracting the data, labels and feeding them in`makeMultilabelTask`.
+
+```{r}
+yeast <- getTaskData(yeast.task)
+labels <- colnames(yeast)[1:14]
+yeast.task <- makeMultilabelTask(id = "multi", data = yeast, target = labels)
+yeast.task
+```
+
+
+#### Constructing a learner
+
+**1. Problem transformation: binary relevance method**
+
+To use this method we create a classification learner the usual way and then use the *binary relevance method* to convert the multilabel classification problem into simple binary classifications for each target on which the binary learner is applied. In mlr, any learner which supports binary classification can be converted into a binary relevance wrapper. 
+
+```{r}
+lrn <- makeLearner("classif.rpart", predict.type = "prob")
+multilabel.lrn1 <- makeMultilabelBinaryRelevanceWrapper(lrn)
+multilabel.lrn1
+```
+
+**2. Agorithm adaptation**
+
+Currently, the only available algorithm adaptation method in `R` which can be used directly to the multilabel classification task is the *random ferns* multilabel algorithm from package `rFerns`. 
+
+```{r}
+multilabel.lrn2 <- makeLearner("multilabel.rFerns")
+multilabel.lrn2
+```
+
+
+#### Train, predict, performance
+
+Once we have the task and the learner, training, predicting, and performance evaluation follow from the previous sections of this document. 
+
+```{r}
+mod1 <- mlr::train(multilabel.lrn1, task = yeast.task)
+# can also pass subsets + weights
+mod1 <- mlr::train(multilabel.lrn1, task = yeast.task, subset = 1:1500, weights = rep(1/1500, 1500))
+
+mod2 <- mlr::train(multilabel.lrn2, yeast.task, subset = 1:100)
+mod2
+
+
+pred1 <- predict(mod1, task = yeast.task, subset = 1:10) # or
+pred1 <- predict(mod1, newdata = yeast[1501:1600, ])
+names(as.data.frame(pred1))
+
+pred2 <- predict(mod2, task = yeast.task)
+names(as.data.frame(pred2))
+```
+
+The prediction object gives us true and predicted values and, depending on the `predict.type` of the learner, we can also get probabilities for each class label. The `get` functions `getPrediction`(Truth, Response, Probabilites) can be used with the prediciton object to extract the associated information. 
+
+For performance evaluation, we use the `performance` function with the prediction object and we optionally define the measures we want to evaluate. The default measure for multilabel classification is the *Hamming loss* (`hamloss`). The Hamming loss is the fraction of labels that are incorrectly predicted and therefore, the smaller the Hamming loss, the better the performance.
+
+
+```{r}
+# available measures
+listMeasures("multilabel")
+
+performance(pred1)
+
+performance(pred2, measures = list(hamloss, timepredict))
+```
+
+
+#### Resampling
+
+In the above examples we did not specify a resampling strategy. As usual, we prefer to evaluate the performance of a learning algorithm when trained with resampling. The function `resample` may be used as in other parts of this tutorial.
+
+```{r}
+rdesc <- makeResampleDesc("CV", stratify = FALSE, iters = 3)
+r1 <- resample(multilabel.lrn1, yeast.task, rdesc, show.info = FALSE)
+r1
+
+r2 <- resample(multilabel.lrn2, yeast.task, rdesc, show.info = FALSE)
+r2
+```
+
+
+#### Binary performance
+
+We can also calculate binary performance measures such as the `mmce`, `auc`, and `acc` for each label using the prediction object returned from the model based on the binary relevance wrapper. The function to use here is `getMultilabelBinaryPerformances`. Note that to claclulate `auc`, we need predicted probabilities. 
+
+```{r}
+# on prediction object returned from predict
+getMultilabelBinaryPerformances(pred1, measures = list(mmce, acc, auc))
+
+# on prediction object returned from resample
+getMultilabelBinaryPerformances(r1$pred, measures = list(mmce, acc, auc))
+```
+
+
+### Learning curves
+
+The mlr package has functions used to generate learning curves and visualize them to improve the performance of a learner. Learning curves usually depict the training error and cross-validation (test) error with increasing data size. These curves are useful in the sense that they can be indicative of a high bias or high variance model. The function `generateLearningCurveData` controls the size of the training observations (through `percs`, the vector of percentages to be drawn from the training split), trains the learner on a single percentage of the training set and evaluates the chosen (aggregated) performance measures on the *complete* test set. The complete test set is specified in the resampling strategy (default is `Holdout`). This is repeated for all values in the percentage vector. Note that for each percentage value, randomly selected observations are drawn from the training set which can result in noisy performance measures. The noise can be reduced by increasing the number of iterations in `resampling`.
+
+
+```{r}
+r <- generateLearningCurveData(
+  learners = list("classif.rpart", "classif.knn"),
+  task = sonar.task,
+  percs = seq(0.1, 1, by = 0.2),
+  measures = list(tp, fp, tn, fn),
+  resampling = makeResampleDesc("CV", iters = 5),
+  show.info = FALSE
+)
+
+# facetted plots created for each measure, learners mapped to color
+plotLearningCurve(r, facet = "measure")
+
+# facetted plots created for each learner, measures mapped to color
+plotLearningCurve(r, facet = "learner")
+```
+
+We can create more complicated learners and pass them on the `generateLearningCurveData` function, as shown in the example below.
+
+```{r}
+lrns <- list(
+  makeLearner("classif.ksvm", id = "ksvm1", sigma = 0.2, C = 2),
+  makeLearner("classif.ksvm", id = "ksvm2", sigma = 0.1, C = 1),
+  "classif.randomForest"
+)
+
+rin <- makeResampleDesc("CV", iters = 5)
+
+lc <- generateLearningCurveData(learners = lrns, task = sonar.task, percs = seq(.1, 1, by = 0.1), measures = acc, resampling = rin, show.info = FALSE)
+
+plotLearningCurve(lc)
+```
+
+The following is experimental `plotLearningCurveGGVIS(r, interaction = "measure")`
+
+### Partial prediction plots
+
+#### Introduction
+
+Machine learning algorithms use available features to make predictions but it is not always obvious how those features are used. Using the mlr package, we can use available functions which aim to estimate the depedence of a learned function on a subset of the feature space. Our response, $Y$ is described as:
+
+$Y = f(X) + \epsilon$,
+
+where $f(X)$ is some unknown function of the feature space, $f(X)$ and $\epsilon$ is a random error term independent of $X$ with mean zero. A learner gives some estimate $\hat{f}(X)$ to give $\hat{Y}$ which denotes predictions on $Y$. Essentially, after the most relevant variables have been identified, we also want to understand the nature of the dependence of the approximation $\hat{f}(X)$ on their joint values. For a feature space that is highly dimensional, $\hat{f}$ may be uninterpretable. Through partial dependence plots, we can more easily visualize how $\hat{f}$ uses the features to make predictions. 
+
+Suppose $X$ is our feature space; we partition the space into two sets, $X_s$ and $X_c$ where $X = X_c \cup X_s$ and $X_s$ is the subset of features which are of interest. The partial dependence of $f$ on $X_s$ is:
+
+$f_s = \mathbb{E}_{X_c}[f(X_s, X_c)] = \int f(X_s, X_c)\,dP(X_c)$;
+
+this is the averaged value of $f$ when $X_s$ is fixed and $X_c$ varies over its marginal distribution, $dP(X_c)$. Since neither $f$ nor $dP(X_c)$ are known, we need to use an estimator to compute $\hat{f}_s$. Note that each subset of predictors $s$, has its own partial dependence function, $f_s$. The estimator function is:
+
+$\hat{f}_s = \frac{1}{N} \sum _{i=1}^N \hat{f}(X_s, X_{ci})$,
+
+where $\brace X_{c1}, \cdots, X_{cN}\rbrace$ represent the different values of $X_c$ that are observed in the training data.  The partial dependence functions defined represent the effect of $X_s$ on $f(X)$ after accounting for the (av- erage) effects of the other variables $X_c$ on $f(X)$. 
+
+The conditional expectation of an observation $i$ can be estimated using the estimator function above (without the averaging). This has the advantage of discovering features which would otherwise be made unclear through the averaging. The partial prediction function, the individual conditional expectation as well as the partial derivatives of the above with respect to the features are computed. The partial derivatives can be useful in the following context. Suppose the estimate $\hat{f}_{X_s}$ is an additive function because of the lack of interactions between $X_s$ and other features $X_c$. Then:
+
+$\hat{f}_{X_s, X_c} = g(X_s) + h(X_c)$
+
+and if $\frac{\partial \hat{f}_{X_s}}{\partial X_s} = g'$, we can imply that $\hat{f}$ does not depend on $X_c$. If there exists variation in estimated partial derivative then this could mean that there is a region of interaction between $X_s$ and $X_c$ in $\hat{f}$. 
+
+More information can be found [here](http://arxiv.org/pdf/1309.6392v2.pdf).
+
+#### Generating partial predictions
+
+To use the function `generatePartialPredictionData`, we need an object from `train`, input data (which can be a `data.frame` or a `task`), and a features character vector for which we want to want to calculate the partial prediction of `\hat{f}`. We need a feature grid for every element of the character vector features passed. The default is a uniform grid of length 10 (this may be set by `gridsize`) from the empirical min to the empirical max (these may also be set through `fmin` and `fmax`). Resampling is also available for the feature data (in the `features` vector) through the `bootstrap` or `resample` methods. 
+
+```{r}
+lrn.classif <- makeLearner("classif.ksvm", predict.type = "prob")
+fit.classif <- train(lrn.classif, iris.task)
+pd <- generatePartialPredictionData(fit.classif, input = iris.task, features = "Petal.Width")
+pd$data[1:5, ]
+pd$data[11:15, ]
+```
+
+Suppose now we pass two features in the `features` vector. If `interaction = FALSE` (default) then $X_s$ is assumed to be unidimensional and partial predictions are generated for each feature separately (`NA` is shown for the feature that has not been used for the prediction). If `interaction = TRUE`, then the individual feature grids are combined using the Cartesian product and the estimator produces a partial prediction for every combination of unique feature values.
+
+```{r}
+# interaction = FALSE
+pd.lst <- generatePartialPredictionData(fit.classif, iris.task, c("Petal.Width", "Petal.Length"), interaction = FALSE)
+head(pd.lst$data)
+tail(pd.lst$data)
+
+# interaction = TRUE
+pd.int <- generatePartialPredictionData(fit.classif, iris.task, c("Petal.Width", "Petal.Length"), interaction = TRUE)
+pd.int
+```
+
+The object `pd.int` creates a feature grid of $10 \times 10$ for every combination of feature values and estimates probabilities corresponding to each unique combination for each class in the target variable. From the definition of the estimator function, the mean prediction is returned which, here, are represented by the mean class probabilites. It is possible to return other summaries of the predictions using the `fun` argument. We show this using a `regression` task.
+
+```{r}
+lrn.regr <- makeLearner("regr.ksvm")
+fit.regr <- train(lrn.regr, bh.task)
+pd.regr <- generatePartialPredictionData(fit.regr, bh.task, "lstat", fun = median)
+pd.regr
+```
+
+Note that the function argument must return a numeric vector of length 1 or 3.
+
+```{r}
+pd.ci <- generatePartialPredictionData(fit.regr, bh.task, "lstat", fun = function(x) quantile(x, c(.25, .5, .75)))
+pd.ci
+```
+
+
+```{r}
+pd.classif <- generatePartialPredictionData(fit.classif, iris.task, "Petal.Length", fun = median)
+pd.classif
+```
+
+Using the argument `individual = TRUE`, we obtain te conditional expectation of the learned function at observation $i$. This is shown with a regression task below. The resulting object contains $N$ predictions for each point in the feature grid (so, for the `bh.task`, we have 506 obs times the 10 points in the gird therefore 5060 predictions). 
+
+```{r}
+pd.ind.regr <- generatePartialPredictionData(fit.regr, bh.task, "lstat", individual = TRUE)
+pd.ind.regr
+```
+
+The `idx` column in the `$data` element gives the index of the observation. In classification tasks, `idx` gives the index corresponding to the observation and the class target label.
+
+```{r}
+pd.ind.classif <- generatePartialPredictionData(fit.classif, iris.task, "Petal.Length", individual = TRUE)
+pd.ind.classif
+```
+
+If `individual = TRUE`, through the argument `center`, we can pass a fixed value for each feature in the `features` vector. This fixed value is used to center the data by subtracting it from each individual prediction made across the prediction grid. 
+
+```{r}
+iris <- getTaskData(iris.task)
+pd.ind.classif <- generatePartialPredictionData(fit.classif, iris.task, "Petal.Length", individual = TRUE, center = list("Petal.Length" = min(iris$Petal.Length)))
+```
+
+Partial derivatives can also be computed for individual and aggregate partial predictions. This is restricted to one feature at a time. 
+
+```{r}
+pd.regr.der <- generatePartialPredictionData(fit.regr, bh.task, "lstat", derivative = TRUE)
+head(pd.regr.der$data)
+
+pd.regr.der.ind <- generatePartialPredictionData(fit.regr, bh.task, "lstat", individual = TRUE, derivative = TRUE)
+head(pd.regr.der.ind$data)
+
+pd.classif.der <- generatePartialPredictionData(fit.classif, iris.task, "Petal.Width", derivative = TRUE)
+head(pd.classif.der$data)
+
+pd.classif.der.ind <- generatePartialPredictionData(fit.classif, iris.task, "Petal.Width", derivative = TRUE, individual = TRUE)
+head(pd.classif.der.ind$data)
+```
+
+#### Plotting partial predictions
+
+The resulting object from `generatePartialPredictionData` can be visualized with the functions `plotPartialPrediction` and `plotPartialPredictionGGVIS`. 
+
+**Regression: single feature**
+
+The result is a line plot showing the dependence on the target on the chosen feature. The markers on the line correspond to the points in the prediction plot. 
+```{r}
+plotPartialPrediction(pd.regr)
+```
+
+**Classification: single feature**
+
+In classification, we have a line plot of the class probability against the selected feature for each class in the target variable.
+
+```{r}
+plotPartialPrediction(pd.classif)
+```
+
+
+**Regression: single feature, `fun` enabled**
+
+With the `fun` argument used, the bounds are automatically shown with a grey region. This is also true when the learner has `predict.type = "se"`.
+
+```{r}
+plotPartialPrediction(pd.ci)
+```
+
+**Regression: multiple features, `fun` enabled**
+
+When multiple features are passed in the features vector but with `interaction = FALSE`, we obtain facetted plots to show the dependence of target on each feature.
+
+```{r}
+fit.se <- train(makeLearner("regr.randomForest", predict.type = "se"), bh.task)
+pd.se <- generatePartialPredictionData(fit.se, bh.task, c("lstat", "crim"))
+plotPartialPrediction(pd.se)
+```
+
+**Classification: multiple features**
+
+```{r}
+plotPartialPrediction(pd.lst)
+```
+
+
+**Classification example: `interaction = TRUE`**
+
+When `interaction = TRUE`, one variable is used for facetting and for each value in the grid for the chosen variable, we get a partial prediction plot against the variable not used in facetting.
+
+```{r}
+plotPartialPrediction(pd.int, facet = "Petal.Length")
+```
+
+**Individual predictions**
+
+With `individual = TRUE`, we obtain all individual conditional expectation curves.
+
+```{r}
+plotPartialPrediction(pd.ind.regr)
+```
+
+When the data is centered (by some given fixed value of $X_s$), we obtain a fixed intercept, as shown below.
+
+```{r}
+plotPartialPrediction(pd.ind.classif)
+```
+
+**Plotting derivatives**
+
+This works the same way: we use the returned object when `derivative = TRUE` to return the derivatives. What we are looking for here is variation in the derivative with the selected feature. If no variation exists, the result would suggest that the model is additive in the selected feature and no interaction occurs with other predictors.
+
+```{r}
+plotPartialPrediction(pd.regr.der)
+```
+
+```{r}
+plotPartialPrediction(pd.regr.der.ind)
+```
+
+```{r}
+plotPartialPrediction(pd.classif.der.ind)
+```
+
+These plots can identify regions where there may be interactions with the selected features, which can then further be investigated.
+
+### Classifier calibration
+
+A calibrated classifiers is one where the predicted probability of a class closely matches the frequency of that class. The function `generateCalibrationData` takes as an input an object or a list of objects returned from `predict`, `resample`, or an object returned from  `benchmark`. The objects must be from a binary or multiclass classification task with learners that support `predict.type = "prob"`. The function groups data points with similar predicted probabilites for each class. The object has elements `$data`, `$proportion`, and `$task`. The `$proportion` element is a `data.frame` with `Learner`, `bin`, `Class`, and `Proportion` columns. The `Proportion` column gives the proportion of observations from class `Class` for each bin among all observations with posterior probabilities of that class. For example, for observations that are predicted to have class "A" with probability (0,0.1], what is the proportion of said observations which have class "A"? The bins are calculated according to the `breaks` or `groups` argument (default is `breaks = "Sturges"`).
+
+```{r}
+lrn <- makeLearner("classif.rpart", predict.type = "prob")
+mod <- train(lrn, task = sonar.task)
+pred <- predict(mod, task = sonar.task)
+cal <- generateCalibrationData(pred)
+cal$proportion
+```
+
+With `groups = n` where `n` is the number of groups, `cut2` is used to create bins with approximately equal number of observations in each group. 
+
+```{r}
+cal <- generateCalibrationData(pred, groups = 3)
+cal$proportion
+```
+
+The function `plotCalibration` uses the object returned from `generateCalibrationData` to plot the proportion of each class in each bin against the bins. 
+
+```{r}
+plotCalibration(cal)
+```
+
+The function also plots a reference line representing the perfect classifier. A rug plot (this draws ticks for each value) is also shown at the top and bottom. At the top, the ticks represent the "positive" class in each bin while at the bottom, the ticks represent the "negative" class. A perfect classifier would have all the positive classes at the top right (correct class predicted with high probability) and all the negative classes at the bottom left. 
+
+In the plot above, we only had the three bins but, in situations where we have multiple bins, because of the discretization of the probabilities, it might be best to use `smooth = TRUE` which replaces the estimated proportions with a loess smoother. 
+
+```{r}
+cal <- generateCalibrationData(pred)
+plotCalibration(cal, smooth = TRUE)
+```
+
+While the plots were generated for a binary classification task, they do generalize to mutliclass classification examples. We show this with our favorite `iris.task`.
+
+```{r}
+lrns <- list(
+  makeLearner("classif.randomForest", predict.type = "prob"),
+  makeLearner("classif.nnet", predict.type = "prob", trace = FALSE)
+)
+
+mod <- lapply(lrns, train, task = iris.task)
+pred <- lapply(mod, predict, task = iris.task)
+names(pred) = c("randomForest", "nnet")
+cal <- generateCalibrationData(pred, breaks = c(0, .3, .6, 1))
+plotCalibration(cal)
 ```
 
 
